@@ -1,0 +1,66 @@
+# Node backups and troubleshooting
+
+## Back up nodes
+
+Open **Backup & recovery** in Fleet and click **Back up nodes**. The JSON file
+is saved on the controller under `<ComfyUI user directory>/fleet/backups`;
+the panel shows its filename. Copy it wherever you keep configuration backups.
+You can do this while jobs are running.
+
+The backup contains only node names, addresses, enabled states and their saved
+order. It contains no jobs, prompts, workflows, history or input/output files.
+It cannot recover a lost queue. It does contain your worker addresses.
+
+## Restore nodes
+
+1. Stop the controller's ComfyUI process.
+2. From the ComfyUI directory, run this with its Python environment:
+
+   ```sh
+   python custom_nodes/ComfyUI-Fleet/tools/restore.py BACKUP.json user/fleet
+   ```
+
+   Replace `BACKUP.json` with the backup's path. If you use a custom ComfyUI user
+   directory, replace `user/fleet` with that directory's `fleet` subdirectory.
+3. Start ComfyUI. Fleet uses the restored node order and enabled states.
+
+Restoring updates node configuration and preserves any existing jobs. It refuses
+changes that would leave active jobs, pending downloads or queued work without
+their required nodes. Resolve that work in Fleet before retrying the restore.
+
+## Restart the controller
+
+Leave `<ComfyUI user directory>/fleet` intact. Waiting jobs survive a restart,
+and Fleet reconnects to remote workers to check work already assigned.
+It never automatically reruns a job whose outcome is uncertain.
+
+If the controller also uses its own GPU, restarting ComfyUI can interrupt that
+job. Remote workers can keep running. Closing the browser does not stop jobs.
+
+## Troubleshooting
+
+| Problem | Action |
+| --- | --- |
+| Worker cannot be reached | Check its address, port and network access from the controller. See [installation](INSTALL.md#connect-your-workers). |
+| Job failed | Fix the workflow or worker, then use **Re-enable batch** to let that worker take remaining jobs from the batch. Use **Run** to submit the failed job again if needed. |
+| Results could not be saved | Fix connectivity or storage, then choose **Retry saving results**. This downloads results without executing the workflow again. |
+| Job says **Needs review** | Check the worker before submitting replacement work. If the job has stopped, try **Verify inactivity and release worker**. Fleet keeps the slot reserved if it cannot verify that release is safe. |
+| Storage error stops scheduling | Check disk space and permissions, then restart with the same state directory. Do not delete the database to clear the error. |
+
+## Stored data
+
+Fleet keeps job prompts, workflows and input copies on disk while needed for
+queued or unfinished work, uncertain outcomes, or result collection. Finished
+job records and unused input copies are removed automatically. Small submission
+receipts containing IDs and a settings digest remain to prevent duplicate jobs
+when a browser retries a request.
+
+Finished-job history is held in memory, capped at 10,000 entries, and cleared
+when the controller restarts. ComfyUI's **Clear history** clears both Fleet and
+ordinary controller history. It leaves separate workers' history intact.
+
+Clearing history or removing finished job records does not delete generated
+files, original inputs, worker files or node backups. Delete those separately
+when you no longer need them. Fleet does not store image previews.
+
+See [usage](USAGE.md#find-results) for result locations.

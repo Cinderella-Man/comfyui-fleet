@@ -1,0 +1,16 @@
+aiohappyeyeballs==2.7.1
+aiohttp==3.12.15
+aiosignal==1.4.0
+attrs==26.1.0
+frozenlist==1.8.0
+idna==3.20
+iniconfig==2.3.0
+multidict==6.9.1
+packaging==26.3
+pluggy==1.6.0
+propcache==0.5.4
+Pygments==2.21.0
+pytest==8.4.2
+ruff==0.13.2
+typing_extensions==4.16.0
+yarl==1.25.1
