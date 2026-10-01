@@ -38,19 +38,19 @@ needs attention.
 
 ### Add nodes
 
-https://github.com/user-attachments/assets/f23f42b0-9340-48a5-a32c-ce2d40709c58
+https://github.com/user-attachments/assets/d5e7653f-d027-4b1f-9456-16389811f7f6
 
 ### Submit jobs
 
-https://github.com/user-attachments/assets/4dc647fe-fb62-4641-84c4-01fed5828784
+https://github.com/user-attachments/assets/2c0fcabc-8420-496e-b444-64cdea8f122f
 
 ### Reorder queued batches
 
-https://github.com/user-attachments/assets/2496c077-d3da-4aaa-bdbb-e20df2b2b93e
+https://github.com/user-attachments/assets/f009ed65-5e4f-4e0f-882a-8ea678afe505
 
 ### Set node priority
 
-https://github.com/user-attachments/assets/9a9bee2a-06bf-4840-aac2-b8ff9ec85ccb
+https://github.com/user-attachments/assets/350ed8f3-d247-43d2-a64b-0e50e62a41f4
 
 ## Development
 
