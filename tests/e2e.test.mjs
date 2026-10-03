@@ -1017,6 +1017,8 @@ test("dragging nodes saves dispatch priority: the first free enabled node gets t
   await submit("Use the next free node",1);
   current=await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
   const second=current.jobs.find(j=>j.id!==first.id);assert.equal(second.worker_id,"node-1");
+  // Wait for the queue row to disappear before measuring the cards' drag positions.
+  await page.getByText("No batches waiting",{exact:true}).waitFor();
   await dragBefore("Node 1","Node 2");
   assert.deepEqual((await state()).jobs.map(j=>[j.id,j.worker_id]),current.jobs.map(j=>[j.id,j.worker_id]));
   for(const job of [first,second]) await post("/fixture",{worker:job.worker_id,complete:job.remote_id});
@@ -1291,4 +1293,205 @@ test("clearing history removes completed activity from hidden node cards", {time
   });
   const text=await page.locator('.fleet-worker-details').textContent();
   assert.equal(text,'',"Finished activity must be released, not only hidden");
+});
+
+async function openBatchEditor(page, id, label="Edit workflow") {
+  await page.evaluate(()=>window.comfyFleet.refresh());
+  const row=page.locator(`[data-batch-id="${id}"]`);
+  await row.locator("summary").click();
+  await row.getByRole("button",{name:label,exact:true}).click();
+  await page.getByRole("button",{name:"Save to batch",exact:true}).waitFor();
+}
+
+test("editing restores authored source, autosaves across reload, and atomically replaces remaining jobs",{timeout:45000},async t=>{
+  const {page,submit,state,until,post}=await setup(t);
+  await page.evaluate(async()=>{
+    const {app}=await import('/scripts/app.js');
+    app.rootGraph.extra.prompt="{a|b}";
+    app.rootGraph.nodes=[{widgets:[{beforeQueued(){app.rootGraph.extra.prompt="a"}}]}];
+  });
+  const accepted=await submit("Production",6);
+  await until(s=>s.jobs.filter(job=>job.acknowledged).length===2);
+  const original=await state();
+  await openBatchEditor(page,accepted.batch_id);
+  assert.equal(await page.evaluate(async()=>(await import('/scripts/app.js')).app.rootGraph.extra.prompt),"{a|b}");
+  assert.equal((await state()).edit.batch_id,accepted.batch_id);
+  assert.equal(await page.evaluate(async()=>(await import('/scripts/app.js')).app.queuePrompt(0,1)),false);
+  assert.equal((await state()).jobs.length,6);
+  const autosaved=page.waitForResponse(r=>r.url().endsWith('/fleet/edit/draft') && r.request().postDataJSON().source.extra.prompt==="{c|d}");
+  await page.evaluate(async()=>{(await import('/scripts/app.js')).app.rootGraph.extra.prompt="{c|d}"});
+  assert((await autosaved).ok());
+  await post('/fixture',{restart:true});
+  await page.reload();
+  await page.getByRole("button",{name:"Manage nodes",exact:true}).waitFor();
+  await openBatchEditor(page,accepted.batch_id,"Resume editing");
+  assert.equal(await page.evaluate(async()=>(await import('/scripts/app.js')).app.rootGraph.extra.prompt),"{c|d}");
+  const saved=page.waitForResponse(r=>r.url().endsWith('/fleet/edit/save'));
+  await page.getByRole('button',{name:'Save to batch',exact:true}).click();
+  const response=await saved;assert.equal(response.ok(),true,await response.text());
+  await until(s=>!s.edit);
+  const ids=(await response.json()).job_ids;
+  assert.equal(ids.length,4);
+  const after=await state();
+  assert.deepEqual(after.jobs.map(j=>j.id),original.jobs.map(j=>j.id));
+  for(const id of ids){
+    const detail=await (await page.request.get(new URL(`/fleet/jobs/${id}`,page.url()).href)).json();
+    assert.equal(detail.workflow?.extra_data?.extra_pnginfo?.workflow?.extra?.prompt,"{c|d}");
+  }
+});
+
+test("later edit holds assignment at its position, locks reorder, and discard releases original work",{timeout:45000},async t=>{
+  const {page,submit,state,until,post,fixture}=await setup(t,{nodeCount:1});
+  const first=await submit("First",2), second=await submit("Second",2), third=await submit("Third",1);
+  await until(s=>s.jobs.some(j=>j.acknowledged));
+  await openBatchEditor(page,second.batch_id);
+  const reordered=await page.request.post(new URL('/fleet/queue/reorder',page.url()).href,{data:{batch_id:third.batch_id,before_batch_id:first.batch_id}});
+  assert.equal(reordered.status(),409);
+  for(let index=0;index<2;index++){
+    const current=await until(s=>s.jobs.some(j=>j.batch_id===first.batch_id&&j.acknowledged&&j.occupied));
+    const job=current.jobs.find(j=>j.batch_id===first.batch_id&&j.occupied);
+    await post('/fixture',{worker:job.worker_id,complete:job.remote_id});
+    await until(s=>!s.jobs.some(j=>j.id===job.id&&j.occupied));
+  }
+  await page.waitForTimeout(800);
+  assert(!(await state()).jobs.some(j=>j.occupied));
+  assert.equal(Object.values(await fixture()).flatMap(w=>w.pending).filter(id=>id!=="native-job").length,0);
+  await page.getByRole('button',{name:'Discard changes',exact:true}).click();
+  const resumed=await until(s=>s.jobs.some(j=>j.batch_id===second.batch_id&&j.occupied));
+  assert.equal(resumed.edit,null);
+});
+
+test("retrying an unconfirmed batch save reuses the prepared request without rerunning widget hooks",{timeout:45000},async t=>{
+  const {page,submit,until}=await setup(t);
+  const accepted=await submit("Retry",5);
+  await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
+  await openBatchEditor(page,accepted.batch_id);
+  await page.evaluate(async()=>{
+    const {app}=await import('/scripts/app.js');
+    const original=app.graphToPrompt;
+    window.preparations=0;
+    app.graphToPrompt=async(...args)=>{window.preparations++;return original.apply(app,args)};
+  });
+  const requests=[];
+  await page.route('**/fleet/edit/save',async route=>{
+    requests.push(route.request().postData());
+    if(requests.length===1)await route.abort('failed');else await route.continue();
+  });
+  await page.getByRole('button',{name:'Save to batch',exact:true}).click();
+  await page.getByRole('button',{name:'Retry save',exact:true}).waitFor();
+  assert.equal(await page.evaluate(()=>window.preparations),3);
+  assert.equal(await page.evaluate(async()=>{
+    const {app}=await import('/scripts/app.js');
+    return app.extensionManager.workflow.openWorkflows.length===2 && Boolean(app.rootGraph.extra.fleet_edit_id);
+  }),true,"An unconfirmed save must keep the editing tab open");
+  await page.getByRole('button',{name:'Retry save',exact:true}).click();
+  await until(s=>!s.edit);
+  assert.equal(requests.length,2);
+  assert.equal(requests[0],requests[1]);
+  assert.equal(await page.evaluate(()=>window.preparations),3);
+});
+
+test("an abandoned edit can be discarded from the queue without loading its workflow",{timeout:45000},async t=>{
+  const {page,submit,until,state}=await setup(t);
+  const accepted=await submit("Abandoned",5);
+  await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
+  await openBatchEditor(page,accepted.batch_id);
+  await page.reload();
+  await page.getByRole('button',{name:'Manage nodes',exact:true}).waitFor();
+  const row=page.locator(`[data-batch-id="${accepted.batch_id}"]`);
+  await row.locator('summary').click();
+  await row.getByRole('button',{name:'Discard changes and resume',exact:true}).click();
+  await page.getByRole('dialog').getByRole('button',{name:'Discard changes',exact:true}).click();
+  await until(s=>!s.edit);
+  assert.equal((await state()).jobs.length,5);
+  assert.equal(await page.locator('.fleet-edit-bar:visible').count(),0);
+});
+
+test("discarding an inactive edit closes only its tab without switching the current workflow",{timeout:30000},async t=>{
+  const {page,submit,until}=await setup(t);
+  const accepted=await submit('Production',5);
+  await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
+  await openBatchEditor(page,accepted.batch_id);
+  await page.evaluate(async()=>{
+    const {app}=await import('/scripts/app.js');
+    window.testApp=app;
+    await app.loadGraphData({nodes:[],extra:{unsaved:'Current work'}},true,true,'Another workflow');
+  });
+  const row=page.locator(`[data-batch-id="${accepted.batch_id}"]`);
+  await row.locator('summary').click();
+  await row.getByRole('button',{name:'Discard changes and resume',exact:true}).click();
+  await page.getByRole('dialog').getByRole('button',{name:'Discard changes',exact:true}).click();
+  await until(s=>!s.edit);
+  await page.waitForFunction(()=>window.testApp.extensionManager.workflow.openWorkflows.length===2);
+  assert.deepEqual(await page.evaluate(()=>({
+    names:window.testApp.extensionManager.workflow.openWorkflows.map(w=>w.filename),
+    active:window.testApp.extensionManager.workflow.activeWorkflow.filename,
+    extra:window.testApp.rootGraph.extra,
+  })),{names:['Production.json','Another workflow'],active:'Another workflow',extra:{unsaved:'Current work'}});
+});
+
+test("discarding the last open edit tab returns to a blank workflow",{timeout:30000},async t=>{
+  const {page,submit,until}=await setup(t);
+  const accepted=await submit('Production',5);
+  await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
+  await openBatchEditor(page,accepted.batch_id);
+  await page.evaluate(async()=>{
+    const {app}=await import('/scripts/app.js');
+    window.testApp=app;
+    const workflows=app.extensionManager.workflow;
+    await workflows.closeWorkflow(workflows.openWorkflows[0]);
+  });
+  await page.getByRole('button',{name:'Discard changes',exact:true}).click();
+  await until(s=>!s.edit);
+  await page.waitForFunction(()=>!window.testApp.rootGraph.extra.fleet_edit_id);
+  assert.deepEqual(await page.evaluate(()=>({
+    names:window.testApp.extensionManager.workflow.openWorkflows.map(w=>w.filename),
+    graph:window.testApp.rootGraph.serialize(),
+  })),{names:['Unsaved Workflow.json'],graph:{nodes:[],extra:{}}});
+});
+
+test("a heartbeat after commit cannot invalidate a save whose response is still arriving",{timeout:30000},async t=>{
+  const {page,submit,until}=await setup(t);
+  const accepted=await submit("Slow response",5);
+  await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
+  await openBatchEditor(page,accepted.batch_id);
+  let deliver;
+  const delivery=new Promise(resolve=>{deliver=resolve});
+  t.after(()=>deliver());
+  await page.route('**/fleet/edit/save',async route=>{
+    const response=await route.fetch();
+    await delivery;
+    await route.fulfill({response});
+  });
+  const heartbeat=page.waitForResponse(r=>r.url().endsWith('/fleet/edit/touch')&&r.status()===409);
+  await page.getByRole('button',{name:'Save to batch',exact:true}).click();
+  await heartbeat;
+  deliver();
+  await page.getByText('Updated the remaining jobs in this batch.',{exact:true}).waitFor();
+  assert.equal(await page.locator('.fleet-edit-bar:visible').count(),0);
+  await until(s=>!s.edit);
+});
+
+for (const action of ['Save to batch','Discard changes']) test(`${action} closes the edit tab and restores the previous unsaved workflow`,{timeout:30000},async t=>{
+  const {page,submit,until}=await setup(t);
+  const accepted=await submit('Production',5);
+  await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
+  const before=await page.evaluate(async()=>{
+    const {app}=await import('/scripts/app.js');
+    window.testApp=app;
+    app.rootGraph.extra.unsaved='Keep my other workflow changes';
+    return {name:app.extensionManager.workflow.activeWorkflow.filename,graph:app.rootGraph.serialize()};
+  });
+  await openBatchEditor(page,accepted.batch_id);
+  await page.evaluate(async()=>{(await import('/scripts/app.js')).app.rootGraph.extra.prompt='Edited draft'});
+  assert.equal(await page.evaluate(async()=>(await import('/scripts/app.js')).app.extensionManager.workflow.openWorkflows.length),2);
+  await page.getByRole('button',{name:action,exact:true}).click();
+  await until(s=>!s.edit);
+  await page.waitForFunction(()=>window.testApp.extensionManager.workflow.openWorkflows.length===1);
+  const after=await page.evaluate(async()=>{
+    const {app}=await import('/scripts/app.js');
+    return {name:app.extensionManager.workflow.activeWorkflow.filename,graph:app.rootGraph.serialize()};
+  });
+  assert.deepEqual(after,before);
+  assert.equal(await page.locator('.fleet-edit-bar:visible').count(),0);
 });

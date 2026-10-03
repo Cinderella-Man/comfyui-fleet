@@ -12,6 +12,7 @@ python3 -m venv .venv
 node --test tests/frontend.test.mjs
 .venv/bin/ruff check fleet tests tools __init__.py
 .venv/bin/ruff format --check fleet tests tools __init__.py
+node --check web/editing.js
 node --check web/fleet.js
 node --check web/panel.js
 node --check web/preparation.js
@@ -32,7 +33,10 @@ connect to your configured workers or require GPUs.
 
 Before a release, smoke test with real ComfyUI workers: submit jobs, check
 collected results and workflow loading, reorder and cancel work, and restart
-the controller with jobs queued.
+the controller with jobs queued. For batch editing, also verify source restoration,
+Run blocking, tab switching, draft recovery, Save and Discard. The 0.2.0 editing
+flow was smoke tested on ComfyUI 0.38.0 / frontend 1.53.6 using isolated state and
+a CPU EmptyImage → SaveImage workflow.
 
 ## Build a release archive
 
@@ -40,7 +44,7 @@ the controller with jobs queued.
 python3 tools/package.py
 ```
 
-This writes `dist/ComfyUI-Fleet-0.1.0.tar.gz` and a SHA-256 manifest. Extract the
+This writes `dist/ComfyUI-Fleet-0.2.0.tar.gz` and a SHA-256 manifest. Extract the
 archive inside the controller's `custom_nodes` directory to install it.
 
 The packager includes an explicit list of runtime files and user guides.

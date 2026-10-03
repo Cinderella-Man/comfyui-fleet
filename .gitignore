@@ -16,11 +16,13 @@
 !/fleet/http.py
 !/fleet/jobs.py
 !/fleet/store.py
+!/fleet/snapshots.py
 !/fleet/validation.py
 !/fleet/worker.py
 !/web/
 /web/*
 !/web/fleet.js
+!/web/editing.js
 !/web/panel.js
 !/web/preparation.js
 !/web/progress.js
@@ -34,6 +36,11 @@
 !/docs/RECOVERY.md
 !/docs/USAGE.md
 !/docs/DEVELOPMENT.md
+!/docs/adr/
+/docs/adr/*
+!/docs/adr/0001-edit-queued-jobs-within-their-batch.md
+!/docs/adr/0002-editing-holds-the-queue-at-the-edited-batch.md
+!/docs/adr/0003-share-prepared-job-data-within-batch-revisions.md
 !/tests/
 /tests/*
 !/tests/conftest.py
@@ -45,6 +52,7 @@
 !/tests/test_artifacts_jobs.py
 !/tests/test_http_controller.py
 !/tests/test_ledger.py
+!/tests/test_editing.py
 !/tests/test_plugin.py
 !/tests/test_restore.py
 !/tests/test_upgrade.py

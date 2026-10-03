@@ -160,7 +160,7 @@ test("native Run constructs distinct batch IDs on plain HTTP without randomUUID"
   const ids = new Set();
   for (let i = 0; i < 100; i++) {
     const body = runInNewContext(statement + '\nbody', {
-      crypto, jobs, args: [-1], createBatchId: () => preparation.createBatchId(crypto),
+      crypto, jobs, source: {nodes: []}, args: [-1], createBatchId: () => preparation.createBatchId(crypto),
     });
     assert.match(body.batch_id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     assert.equal(body.front, true);
@@ -253,3 +253,20 @@ for (const location of ["output", "workflow"]) {
     assert.equal(submitted, 0);
   });
 }
+
+test("authored source is captured before queue callbacks resolve prompts and advance counters", async () => {
+  const values = {prompt:"{a|b}",seed:10};
+  const app = {
+    extensionManager:{workflow:{activeWorkflow:{filename:"Production.json"}}},
+    rootGraph:{serialize:()=>({nodes:[{widgets_values:[values.prompt,values.seed]}]}),
+      nodes:[{widgets:[{beforeQueued(){values.prompt="a"},afterQueued(){values.seed++}}]}]},
+    graphToPrompt:async()=>({output:{1:{class_type:"CustomPrompt",inputs:{...values}}},workflow:app.rootGraph.serialize()}),
+    canvas:{draw(){}},
+  };
+  const source=preparation.captureSource(app);
+  const jobs=await prepareSnapshots(app,()=>{},3);
+  assert.deepEqual(source.nodes[0].widgets_values,["{a|b}",10]);
+  assert.deepEqual(jobs.map(job=>job.output[1].inputs.seed),[10,11,12]);
+  assert(jobs.every(job=>job.output[1].inputs.prompt==="a"));
+  assert.equal(source.extra.fleet.workflow_name,"Production");
+});

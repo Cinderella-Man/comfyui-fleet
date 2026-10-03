@@ -1,6 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { prepareSnapshots, createBatchId } from "./preparation.js";
+import { prepareSnapshots, createBatchId, captureSource } from "./preparation.js";
+import { BatchEditor } from "./editing.js";
 import { FleetPanel } from "./panel.js";
 import { SelectedJob, executionEvents } from "./progress.js";
 
@@ -37,7 +38,7 @@ app.registerExtension({
       }
       return data;
     }
-    const post = (route, body) => json(route, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const post = (route, body, options = {}) => json(route, { ...options, method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     function message(text, error = false) {
       state.error = error ? text : null;
       panel.message(text, error);
@@ -57,6 +58,8 @@ app.registerExtension({
       },
       select,
       retry: refresh,
+      editBatch: id => editor.open(id),
+      discardBatchEdit: id => editor.discardBatch(id),
       cancelQueued: batch_id => mutate("/fleet/queue/cancel", batch_id == null ? {} : { batch_id }),
       reorderBatch: (batch_id, before_batch_id) => mutate("/fleet/queue/reorder", { batch_id, before_batch_id }),
       reorderWorker: (worker_id, before_worker_id) => mutate("/fleet/workers/reorder", { worker_id, before_worker_id }),
@@ -68,6 +71,8 @@ app.registerExtension({
       jobAction: (id, action) => mutate(`/fleet/jobs/${id}/${action}`),
       reenable: (id, worker_id) => mutate(`/fleet/batches/${id}/reenable`, { worker_id }),
     });
+    const editor = new BatchEditor(app, prepareControl, post, refresh, message,
+      () => state.waitingActions > 0 || ["preparing", "submitting"].includes(state.phase));
     const progress = new SelectedJob(dispatch);
     app.extensionManager.registerSidebarTab({ id: "fleet", title: "Fleet", icon: "pi pi-server",
       type: "custom", render: container => {
@@ -104,6 +109,7 @@ app.registerExtension({
       try {
         const before = state.server;
         state.server = await json("/fleet/state");
+        await editor.sync(state.server.edit);
         const signature = data => JSON.stringify(data?.jobs.map(r => [r.id, r.state, r.collection_state, r.hidden]));
         if (signature(before) !== signature(state.server)) {
           dispatch("status", { exec_info: { queue_remaining: state.server.jobs.filter(r => r.state === "waiting" || r.occupied).length } });
@@ -146,6 +152,14 @@ app.registerExtension({
 
     async function prepare(args) {
       state.waitingActions--;
+      if (editor.marker || editor.busy) {
+        message("Use Save to batch or Discard changes for this workflow.", true);
+        return false;
+      }
+      if (args[0] === -1 && state.server?.edit) {
+        message("Queue order is locked while a batch is being edited. Add new work at the end.", true);
+        return false;
+      }
       const count = args[1] ?? 1;
       const options = args[2];
       const targets = Array.isArray(options) ? options : options?.queueNodeIds;
@@ -161,8 +175,9 @@ app.registerExtension({
       dispatch("promptQueueing", { requestId, batchCount: count });
       state.phase = "preparing";
       message(`Preparing ${count} job${count === 1 ? "" : "s"}. None accepted yet.`);
-      let jobs;
+      let jobs, source;
       try {
+        source = captureSource(app);
         jobs = await prepareSnapshots(app, prepareControl, count,
           done => message(`Prepared ${done}/${count} jobs. None accepted yet.`));
       } catch (error) {
@@ -170,7 +185,7 @@ app.registerExtension({
         message(`Preparation failed: ${error.message}. Zero jobs accepted; native seed changes remain.`, true);
         return false;
       }
-      const body = { batch_id: createBatchId(), jobs, front: args[0] === -1 };
+      const body = { batch_id: createBatchId(), source, jobs, front: args[0] === -1 };
       if (new TextEncoder().encode(JSON.stringify(body)).length > 32*1024*1024) {
         state.phase = "error"; message("Prepared batch exceeds 32 MiB; zero jobs accepted.", true); return false;
       }
@@ -204,6 +219,10 @@ app.registerExtension({
 
     function queue(...args) {
       if (disposed) return original.queue.apply(this, args);
+      if (editor.marker || editor.busy) {
+        message("Use Save to batch or Discard changes for this workflow.", true);
+        return Promise.resolve(false);
+      }
       state.waitingActions++;
       const next = serial.then(() => prepare(args));
       serial = next.catch(error => { state.phase = "error"; message(error.message, true); });
@@ -277,6 +296,7 @@ app.registerExtension({
       dispose() {
         if (state.waitingActions || ["preparing", "submitting"].includes(state.phase)) throw new Error("Cannot detach during admission");
         disposed = true; clearInterval(timer); clearTimeout(reconnect); ws?.close();
+        editor.dispose();
         progress.dispose();
         panel.cancelReordering();
         panel.resetAddressCheck();

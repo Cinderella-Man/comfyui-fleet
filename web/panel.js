@@ -429,7 +429,7 @@ export class FleetPanel {
     const renderOrder = () => { this.renderQueue(); this.renderWorkers(); };
     this.queueOrder = new ReorderList({ list: this.queueList, scroller: this.queueBody, rows: this.queueRows,
       key: "batchId", subject: "Batch", plural: "batches", descriptionId: "fleet-drag-help",
-      isDisabled: () => orderingDisabled() || this.workerOrder.busy, render: renderOrder,
+      isDisabled: () => Boolean(this.state?.edit) || orderingDisabled() || this.workerOrder.busy, render: renderOrder,
       announce: (text, error) => this.queueMessage(text, error),
       notify: text => this.notify(text),
       save: (id, before) => this.actions.reorderBatch(id, before), reload: () => this.actions.retry?.() });
@@ -643,7 +643,19 @@ export class FleetPanel {
       .fleet-panel .fleet-batch{position:relative;display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;gap:10px;padding:12px 10px;border:1px solid var(--fleet-line);border-radius:10px;background:var(--fleet-surface)}
       .fleet-panel .fleet-batch strong{display:block;font-size:12px;font-weight:550;overflow-wrap:anywhere;line-height:1.5}
       .fleet-panel .fleet-batch small{display:block;font-size:10px;line-height:1.5;color:var(--fleet-muted);margin-top:3px}
-      .fleet-panel .fleet-batch-footer{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:6px}
+      .fleet-panel .fleet-batch-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.fleet-batch-menu{position:relative;flex:none}
+.fleet-batch-menu summary{cursor:pointer;list-style:none;font-size:22px;padding:0 6px;border-radius:5px}
+.fleet-batch-menu[open] summary{background:var(--comfy-input-bg,#333)}
+.fleet-batch-menu .fleet-edit-workflow,.fleet-batch-menu .fleet-discard-edit{position:absolute;right:0;top:100%;white-space:nowrap;z-index:20;background:var(--comfy-menu-bg,#222);box-shadow:0 4px 16px #0008}
+.fleet-batch-menu .fleet-discard-edit{top:calc(100% + 34px)}
+.fleet-edit-shield{position:fixed;z-index:999;display:grid;place-items:center;background:#111b;color:#eee;font:16px system-ui;cursor:wait}
+.fleet-edit-shield[hidden]{display:none}
+.fleet-edit-bar{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:1000;display:flex;align-items:center;gap:12px;padding:12px 16px;max-width:calc(100vw - 32px);border:1px solid #777;border-radius:10px;background:var(--comfy-menu-bg,#222);color:var(--input-text,#eee);box-shadow:0 4px 20px #0008;font:14px system-ui}
+.fleet-edit-bar[hidden]{display:none}
+.fleet-edit-bar button{white-space:nowrap;padding:8px 12px;border:1px solid #777;border-radius:6px;background:var(--comfy-input-bg,#333);color:inherit;cursor:pointer}
+.fleet-edit-bar button:disabled{opacity:.5;cursor:default}
+.fleet-batch-footer{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:6px}
       .fleet-panel .fleet-batch-footer small{margin:0;min-width:0}
       .fleet-panel .fleet-batch-footer button{flex:none;font-size:10px;padding:4px 7px;min-height:28px}
       .fleet-panel .fleet-batch-count{font-size:11px;color:var(--fleet-text);margin:7px 0 0;line-height:1.5}
@@ -1296,9 +1308,29 @@ export class FleetPanel {
     cancel.title = "Cancel queued jobs in this batch. Active jobs keep running.";
     const footer = element("div", null, { className: "fleet-batch-footer" });
     footer.append(status, cancel);
-    copy.append(name, time, count, progress, footer);
+    const heading = element("div", null, { className: "fleet-batch-heading" });
+    const menu = element("details", null, { className: "fleet-batch-menu" });
+    const toggle = element("summary", "⋯");
+    toggle.setAttribute("aria-label", `Batch actions for ${batch.name}`);
+    const edit = this.button("Edit workflow", async () => {
+      menu.open = false;
+      try { await this.actions.editBatch(batch.id); }
+      catch (error) { this.queueMessage(error.message, true); }
+    });
+    edit.className = "fleet-edit-workflow";
+    menu.addEventListener("keydown", event => { if (event.key === "Escape") { menu.open = false; toggle.focus(); } });
+    const discard = this.button("Discard changes and resume", async () => {
+      menu.open = false;
+      if (!await this.confirmAction("Discard batch changes?", "The batch will keep its previous workflow and queue scheduling will resume.", "Discard changes")) return;
+      try { await this.actions.discardBatchEdit(batch.id); }
+      catch (error) { this.queueMessage(error.message, true); }
+    });
+    discard.className = "fleet-discard-edit";
+    menu.append(toggle, edit, discard);
+    heading.append(name, menu);
+    copy.append(heading, time, count, progress, footer);
     root.append(handle, copy);
-    return { root, handle, name, time, count, progress, status, cancel };
+    return { root, handle, name, time, count, progress, status, cancel, edit, discard };
   }
 
   renderQueue() {
@@ -1306,11 +1338,11 @@ export class FleetPanel {
     const batches = queuedBatches(this.state.jobs, this.state.batch_names, this.state.batch_counts);
     const waiting = batches.reduce((sum, batch) => sum + batch.queued, 0);
     this.queueCount.textContent = `${batches.length} batch${batches.length === 1 ? "" : "es"}`;
-    const busy = this.queueOrder.saving || this.workerOrder.busy || this.cancellingActive || this.cancellingQueuedJobs;
-    const batchBusy = id => this.queueOrder.busy || this.workerOrder.busy || this.cancellingActive || this.cancellingQueue || this.cancellingBatches.has(id) || !this.state.ready;
+    const busy = Boolean(this.state.edit) || this.queueOrder.saving || this.workerOrder.busy || this.cancellingActive || this.cancellingQueuedJobs;
+    const batchBusy = id => this.state.edit?.batch_id === id || this.queueOrder.busy || this.workerOrder.busy || this.cancellingActive || this.cancellingQueue || this.cancellingBatches.has(id) || !this.state.ready;
     this.cancelQueueButton.disabled = busy || Boolean(this.queueOrder.drag) || !waiting || !this.state.ready;
     this.cancelQueueButton.textContent = this.cancellingQueue ? "Cancelling…" : "Cancel queued jobs";
-    this.queueHint.textContent = this.state.paused ? "Scheduling is stopped. Complete the recovery steps before starting new work." :
+    this.queueHint.textContent = this.state.edit ? "A batch is being edited. Earlier work can continue; this batch and everything after it are held. Queue order is locked." : this.state.paused ? "Scheduling is stopped. Complete the recovery steps before starting new work." :
       batches.length ? "Drag batches to change what goes next. Active jobs keep running." : "Use ComfyUI’s Run button to add work.";
     this.queueList.setAttribute("aria-busy", String(this.queueOrder.saving || this.cancellingQueue));
     for (const [id, row] of this.queueRows) row.cancel.disabled = batchBusy(id);
@@ -1327,6 +1359,9 @@ export class FleetPanel {
       if (!row) { row = this.createBatchRow(batch); this.queueRows.set(batch.id, row); }
       if (this.queueList.children[index] !== row.root) this.queueList.insertBefore(row.root, this.queueList.children[index] ?? null);
       row.name.textContent = batch.name;
+      row.discard.hidden = this.state.edit?.batch_id !== batch.id;
+      row.edit.textContent = this.state.edit?.batch_id === batch.id ? "Resume editing" : "Edit workflow";
+      row.edit.disabled = !this.state.ready || Boolean(this.state.edit && this.state.edit.batch_id !== batch.id);
       row.handle.setAttribute("aria-label", `Reorder ${batch.name}`);
       row.handle.disabled = busy || !this.state.ready || batches.length < 2;
       row.cancel.disabled = batchBusy(batch.id);

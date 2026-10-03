@@ -12,6 +12,7 @@ import fleet.store as store_module
 def batch(count=8):
     return {
         "batch_id": str(uuid.uuid4()),
+        "source": {"nodes": []},
         "jobs": [
             {
                 "output": {"1": {"class_type": "SaveImage", "inputs": {"filename_prefix": "test"}}},
@@ -284,7 +285,7 @@ def test_retention_keeps_batch_counts_and_receipts_without_finished_job_records(
         assert restored.state()["batch_names"] == {}
         assert restored.state()["suspensions"] == []
         assert admit(restored, value)["job_ids"] == accepted["job_ids"]
-        assert restored.db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert restored.db.execute("PRAGMA user_version").fetchone()[0] == 3
         assert restored.db.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         restored.close()
@@ -483,7 +484,7 @@ def test_batch_reorder_persists_and_preserves_assigned_and_completed_jobs(ledger
     ledger.close()
     reopened = Ledger(root)
     try:
-        assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 3
         assert reopened.state()["batch_names"] == {first["batch_id"]: "Portraits"}
         claimed = []
         for _ in range(7):

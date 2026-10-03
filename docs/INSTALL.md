@@ -7,6 +7,13 @@ sidebar. That's the installation.**
 The controller is the ComfyUI instance you open in your browser. Workers are
 the ComfyUI instances that execute jobs. Workers do not need Fleet installed.
 
+## Upgrade to 0.2.0
+
+The first start on 0.2.0 discards all waiting jobs from older Fleet versions.
+Submit those batches again after refreshing the browser. Assigned jobs, uncertain
+submissions, result downloads and node configuration are preserved. This is a
+one-time queue reset; new queues survive subsequent restarts normally.
+
 ## Check the folder
 
 Your files should look like this, without an extra nested repository folder:

@@ -85,7 +85,7 @@ class Artifacts:
             publish(state_root, "instance-id", str(uuid.uuid4()).encode())
         self.instance = identity(read_regular(state_root, "instance-id").decode())
 
-    def snapshot(self, graph):
+    def snapshot(self, graph, previous=None):
         assets = []
         for node_id, node in graph.items():
             if node["class_type"] not in ("LoadImage", "LoadImageMask"):
@@ -108,6 +108,25 @@ class Artifacts:
                     "type": kind,
                 }
             )
+            old = (previous or {}).get("graph", {}).get(node_id, {})
+            retained = next(
+                (
+                    asset
+                    for asset in (previous or {}).get("assets", [])
+                    if asset["node_id"] == node_id and asset["source"] == ref
+                ),
+                None,
+            )
+            if (
+                retained
+                and old.get("class_type") == node["class_type"]
+                and old.get("inputs", {}).get("image") == node["inputs"]["image"]
+            ):
+                data = read_regular(self.blobs, retained["sha256"])
+                if hashlib.sha256(data).hexdigest() != retained["sha256"]:
+                    raise ValueError("Input snapshot failed its digest check")
+                assets.append(copy.deepcopy(retained))
+                continue
             data = read_regular(self.roots[kind], value)
             digest = hashlib.sha256(data).hexdigest()
             publish(self.blobs, digest, data)

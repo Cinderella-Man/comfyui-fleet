@@ -42,9 +42,13 @@ document.querySelector('#run').onclick=async()=>{
 </script></body></html>"""
 
 APP = """window.nativeNotifications=[];
+const clone=value=>JSON.parse(JSON.stringify(value));
+const initialWorkflow={filename:'Portraits.json',activeState:{nodes:[],extra:{}}};
+const workflowStore={activeWorkflow:initialWorkflow,openWorkflows:[initialWorkflow],
+ async closeWorkflow(workflow){this.openWorkflows=this.openWorkflows.filter(item=>item!==workflow)}};
 export const app={
  registerExtension(extension){extension.setup()},
- extensionManager:{workflow:{activeWorkflow:{filename:'Portraits.json'}},
+ extensionManager:{workflow:workflowStore,
    toast:{add(options){
      window.nativeNotifications.push(options);
      const notice=document.createElement('article');notice.setAttribute('role','status');
@@ -60,8 +64,17 @@ export const app={
    }},
    registerSidebarTab(tab){tab.render(document.querySelector('#fleet-mount'))},
    unregisterSidebarTab(){document.querySelector('#fleet-mount').replaceChildren()}},
- rootGraph:{nodes:[]},canvas:{draw(){}},
- async graphToPrompt(){return {output:{'1':{class_type:'SaveImage',inputs:{}}},workflow:{nodes:[]}}},
+ rootGraph:{nodes:[],extra:{},serialize(){return {nodes:this.nodes,extra:this.extra}}},canvas:{draw(){}},
+ async loadGraphData(graph,clean,view,name){
+   workflowStore.activeWorkflow.activeState=clone(this.rootGraph.serialize());
+   const workflow=name&&typeof name==='object'?name:workflowStore.openWorkflows.find(item=>item.filename===name)||{filename:name||'Unsaved Workflow.json'};
+   const data=clone(graph);
+   this.rootGraph.nodes=data.nodes;this.rootGraph.extra=data.extra||{};
+   workflow.activeState=clone(data);
+   if(!workflowStore.openWorkflows.includes(workflow))workflowStore.openWorkflows.push(workflow);
+   workflowStore.activeWorkflow=workflow;
+ },
+ async graphToPrompt(){return {output:{'1':{class_type:'SaveImage',inputs:{filename_prefix:this.rootGraph.extra.prompt||'test'}}},workflow:this.rootGraph.serialize()}},
  async queuePrompt(){throw new Error('Native queue must be intercepted by Fleet')}
 };
 const toastMode=new URLSearchParams(location.search).get('toast');
@@ -197,7 +210,7 @@ async def main(root, node_count):
 
         async def source(request):
             name = request.match_info["name"]
-            if name not in ("fleet.js", "panel.js", "preparation.js", "progress.js"):
+            if name not in ("fleet.js", "panel.js", "preparation.js", "progress.js", "editing.js"):
                 raise web.HTTPNotFound()
             return web.FileResponse(Path(__file__).resolve().parents[1] / "web" / name)
 

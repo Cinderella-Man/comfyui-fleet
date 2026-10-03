@@ -347,3 +347,19 @@ def test_cleared_history_does_not_reappear_under_the_self_workers_remote_id(ledg
     assert ledger.state()["jobs"] == []
     assert ledger.job(row["id"]) is None
     assert ledger.db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_edit_retains_unchanged_input_bytes_and_snapshots_changed_references(artifacts):
+    source = artifacts.roots["input"] / "original.png"
+    source.write_bytes(b"original bytes")
+    graph = {"1": {"class_type": "LoadImage", "inputs": {"image": "original.png"}}}
+    saved = artifacts.snapshot(graph)
+    source.unlink()
+    previous = {"graph": graph, "assets": saved}
+    assert artifacts.snapshot(graph, previous) == saved
+    replacement = artifacts.roots["input"] / "replacement.png"
+    replacement.write_bytes(b"new bytes")
+    edited = {"1": {"class_type": "LoadImage", "inputs": {"image": "replacement.png"}}}
+    changed = artifacts.snapshot(edited, previous)
+    assert changed[0]["sha256"] != saved[0]["sha256"]
+    assert read_regular(artifacts.blobs, changed[0]["sha256"]) == b"new bytes"

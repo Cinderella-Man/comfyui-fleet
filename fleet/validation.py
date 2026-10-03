@@ -81,6 +81,14 @@ def workers_config(values):
     return result
 
 
+def source_workflow(value):
+    if not isinstance(value, dict) or not isinstance(value.get("nodes"), list):
+        raise ValueError("An authored source workflow is required; reload the Fleet frontend")
+    if len(canonical(value).encode()) > MAX_BODY:
+        raise ValueError("Source workflow exceeds 32 MiB")
+    return value
+
+
 def prepared_batch(body):
     # Accept an older prepared request, but use job terminology internally.
     if "runs" in body:

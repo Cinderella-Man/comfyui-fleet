@@ -55,6 +55,12 @@ class Routes:
             ("POST", "/queue/reorder", self.reorder_queue),
             ("POST", "/backup", self.backup),
             ("POST", "/batches", self.admit),
+            ("POST", "/edit/begin", self.begin_edit),
+            ("POST", "/edit/draft", self.save_draft),
+            ("POST", "/edit/touch", self.touch_edit),
+            ("POST", "/edit/release", self.release_edit_owner),
+            ("POST", "/edit/discard", self.discard_edit),
+            ("POST", "/edit/save", self.save_edit),
             ("GET", "/batches/{batch_id}", self.batch),
             ("POST", "/batches/{batch_id}/cancel", self.cancel_batch),
             ("POST", "/batches/{batch_id}/reenable", self.reenable),
@@ -165,6 +171,29 @@ class Routes:
 
     async def admit(self, request):
         return web.json_response(await self.ready().admit(await body(request)))
+
+    async def begin_edit(self, request):
+        data = await body(request)
+        return web.json_response(
+            await self.ready().store.call("begin_edit", data["batch_id"], data["owner"])
+        )
+
+    async def save_draft(self, request):
+        return web.json_response(await self.ready().store.call("save_draft", await body(request)))
+
+    async def touch_edit(self, request):
+        return web.json_response(await self.ready().store.call("touch_edit", await body(request)))
+
+    async def release_edit_owner(self, request):
+        return web.json_response(
+            await self.ready().store.call("release_edit_owner", await body(request))
+        )
+
+    async def discard_edit(self, request):
+        return web.json_response(await self.ready().store.call("discard_edit", await body(request)))
+
+    async def save_edit(self, request):
+        return web.json_response(await self.ready().save_edit(await body(request)))
 
     async def batch(self, request):
         result = await self.ready().store.call("batch", request.match_info["batch_id"])

@@ -10,6 +10,16 @@ export function createBatchId(crypto = globalThis.crypto) {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+export function captureSource(app) {
+  const source = JSON.parse(JSON.stringify(app.rootGraph.serialize()));
+  delete source.extra?.fleet_edit_id;
+  const filename = app.extensionManager?.workflow?.activeWorkflow?.filename;
+  const name = typeof filename === "string" ? filename.replace(/\.json$/i, "").trim().slice(0, 200) : "";
+  if (name && !app.rootGraph.extra?.fleet_edit_id) source.extra = { ...source.extra,
+    fleet: { ...source.extra?.fleet, workflow_name: name } };
+  return source;
+}
+
 export async function prepareSnapshots(app, promotedControl, count, onPrepared = () => {}) {
   if (typeof promotedControl !== "function") throw new Error("Missing native promoted-widget helper");
   const graph = app.rootGraph;
@@ -21,6 +31,7 @@ export async function prepareSnapshots(app, promotedControl, count, onPrepared =
     if (next.size > 100) throw new Error("Graph hierarchy exceeds supported limit");
     const nodes = [];
     for (const node of current.nodes) {
+      if (node.has_errors) throw new Error("Resolve missing workflow nodes before preparing jobs");
       if (node.isSubgraphNode?.() && node.subgraph) nodes.push(...collect(node.subgraph, next));
       nodes.push(node);
       if (nodes.length > 1024) throw new Error("Graph exceeds supported node limit");

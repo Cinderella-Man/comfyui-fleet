@@ -36,6 +36,31 @@ move with the arrow keys, then press Space to save or Escape to cancel.
 **To stop all Fleet work, cancel queued jobs first, then active jobs.**
 These controls affect only Fleet jobs.
 
+## Edit a queued batch
+
+Open a batch’s **⋯** menu and choose **Edit workflow**. Fleet opens a separate
+ComfyUI tab containing the original authored workflow, including prompt patterns,
+all stages and widget controls. Use **Save to batch** or **Discard changes**;
+normal Run is disabled in this tab.
+After a successful Save or Discard, Fleet closes the editing tab and returns to
+your previous workflow, preserving its unsaved changes.
+
+Only jobs still waiting are changed. Save prepares that many jobs again through
+ComfyUI, so random choices are regenerated and counters start from the edited
+values. Assigned and finished jobs keep their existing settings and identities.
+Unchanged image inputs retain their saved bytes; newly selected inputs are
+snapshotted when saving.
+
+One batch can be edited at a time. Earlier batches can continue, but the edited
+batch and everything after it cannot start. Queue ordering is locked until Save
+or Discard; new submissions can still append. Assigned jobs continue running.
+
+Drafts save automatically to the controller. Closing the browser keeps the hold;
+use **⋯ → Resume editing** to recover the draft, then Save or Discard. Another
+browser can resume after the old browser’s short ownership lease expires. A
+failed save keeps the original queued jobs and the draft. **Retry save** resends
+the same prepared jobs without making new random choices.
+
 ## Manage nodes
 
 Use **Manage nodes** to add, rename or remove nodes. Click **Done** to save;
