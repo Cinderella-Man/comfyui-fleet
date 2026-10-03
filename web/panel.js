@@ -616,6 +616,8 @@ export class FleetPanel {
       .fleet-panel .fleet-confirm h3{margin:0 0 10px;font-size:18px;line-height:1.4;overflow-wrap:anywhere}
       .fleet-panel .fleet-confirm p{margin:0 0 18px;color:var(--fleet-muted)}
       .fleet-panel .fleet-confirm footer{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px}
+      .fleet-panel .fleet-rename-field{margin-bottom:18px}
+      .fleet-panel .fleet-rename-error{color:#f2a6a6}
       .fleet-panel .fleet-version-notice{border:1px solid rgba(226,177,106,.3);border-radius:14px;padding:20px;background:linear-gradient(145deg,rgba(226,177,106,.075),var(--fleet-surface) 65%);margin:0 0 20px;overflow-wrap:anywhere}
       .fleet-panel .fleet-version-icon{display:grid;place-items:center;width:40px;height:40px;border:1px solid rgba(226,177,106,.25);border-radius:12px;background:rgba(226,177,106,.1);color:#e2b16a;margin-bottom:18px}
       .fleet-panel .fleet-version-icon svg{width:22px;height:22px}
@@ -647,8 +649,8 @@ export class FleetPanel {
 .fleet-batch-menu{position:relative;flex:none}
 .fleet-batch-menu summary{cursor:pointer;list-style:none;font-size:22px;padding:0 6px;border-radius:5px}
 .fleet-batch-menu[open] summary{background:var(--comfy-input-bg,#333)}
-.fleet-batch-menu .fleet-edit-workflow,.fleet-batch-menu .fleet-discard-edit{position:absolute;right:0;top:100%;white-space:nowrap;z-index:20;background:var(--comfy-menu-bg,#222);box-shadow:0 4px 16px #0008}
-.fleet-batch-menu .fleet-discard-edit{top:calc(100% + 34px)}
+.fleet-batch-menu .fleet-batch-actions{position:absolute;right:0;top:100%;display:flex;flex-direction:column;white-space:nowrap;z-index:20;padding:4px;border:1px solid var(--fleet-line);border-radius:8px;background:var(--comfy-menu-bg,#222);box-shadow:0 4px 16px #0008}
+.fleet-batch-menu .fleet-batch-actions button{text-align:left;border-color:transparent}
 .fleet-edit-shield{position:fixed;z-index:999;display:grid;place-items:center;background:#111b;color:#eee;font:16px system-ui;cursor:wait}
 .fleet-edit-shield[hidden]{display:none}
 .fleet-edit-bar{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:1000;display:flex;align-items:center;gap:12px;padding:12px 16px;max-width:calc(100vw - 32px);border:1px solid #777;border-radius:10px;background:var(--comfy-menu-bg,#222);color:var(--input-text,#eee);box-shadow:0 4px 20px #0008;font:14px system-ui}
@@ -1115,6 +1117,54 @@ export class FleetPanel {
     });
   }
 
+  renameBatch(batch, opener) {
+    if (this.confirmation || !this.state.ready) return;
+    const dialog = element("dialog", null, { className: "fleet-confirm" });
+    dialog.setAttribute("aria-labelledby", "fleet-rename-title");
+    const form = element("form");
+    const field = element("label", "Batch name", { className: "fleet-rename-field" });
+    const input = element("input", null, { type: "text", value: batch.name, maxLength: 200, required: true });
+    field.append(input);
+    const error = element("p", null, { className: "fleet-rename-error", hidden: true });
+    error.setAttribute("role", "alert");
+    const cancel = element("button", "Cancel", { type: "button" });
+    const save = element("button", "Save", { type: "submit", className: "fleet-primary" });
+    const footer = element("footer");
+    footer.append(cancel, save);
+    form.append(element("h3", "Rename batch", { id: "fleet-rename-title" }), field, error, footer);
+    dialog.append(form);
+    this.root.append(dialog);
+    let busy = false, closed = false;
+    const finish = () => {
+      if (closed) return;
+      closed = true; this.confirmation = null;
+      dialog.close(); dialog.remove(); opener?.focus();
+    };
+    this.confirmation = { cancel: finish };
+    input.addEventListener("input", () => { save.disabled = !input.value.trim(); error.hidden = true; });
+    cancel.addEventListener("click", finish);
+    dialog.addEventListener("cancel", event => { event.preventDefault(); if (!busy) finish(); });
+    dialog.addEventListener("close", finish);
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      if (busy || !input.value.trim()) return;
+      busy = true; input.disabled = cancel.disabled = save.disabled = true;
+      save.textContent = "Saving…"; error.hidden = true;
+      try {
+        await this.actions.renameBatch(batch.id, input.value.trim());
+        finish();
+        this.notify("Batch name saved.");
+      } catch (failure) {
+        error.textContent = `Could not rename batch. ${failure.message}`;
+        error.hidden = false;
+      } finally {
+        busy = false; input.disabled = cancel.disabled = save.disabled = false;
+        save.textContent = "Save";
+      }
+    });
+    dialog.showModal(); input.focus(); input.select();
+  }
+
   async saveBackup() {
     this.backupFeedback.hidden = false;
     this.backupFeedback.dataset.error = "false";
@@ -1312,6 +1362,10 @@ export class FleetPanel {
     const menu = element("details", null, { className: "fleet-batch-menu" });
     const toggle = element("summary", "⋯");
     toggle.setAttribute("aria-label", `Batch actions for ${batch.name}`);
+    const rename = this.button("Rename batch", () => {
+      menu.open = false;
+      this.renameBatch(batch, toggle);
+    });
     const edit = this.button("Edit workflow", async () => {
       menu.open = false;
       try { await this.actions.editBatch(batch.id); }
@@ -1326,11 +1380,13 @@ export class FleetPanel {
       catch (error) { this.queueMessage(error.message, true); }
     });
     discard.className = "fleet-discard-edit";
-    menu.append(toggle, edit, discard);
+    const actions = element("div", null, { className: "fleet-batch-actions" });
+    actions.append(rename, edit, discard);
+    menu.append(toggle, actions);
     heading.append(name, menu);
     copy.append(heading, time, count, progress, footer);
     root.append(handle, copy);
-    return { root, handle, name, time, count, progress, status, cancel, edit, discard };
+    return { batch, root, handle, name, time, count, progress, status, cancel, toggle, rename, edit, discard };
   }
 
   renderQueue() {
@@ -1357,8 +1413,11 @@ export class FleetPanel {
     batches.forEach((batch, index) => {
       let row = this.queueRows.get(batch.id);
       if (!row) { row = this.createBatchRow(batch); this.queueRows.set(batch.id, row); }
+      Object.assign(row.batch, batch);
       if (this.queueList.children[index] !== row.root) this.queueList.insertBefore(row.root, this.queueList.children[index] ?? null);
       row.name.textContent = batch.name;
+      row.toggle.setAttribute("aria-label", `Batch actions for ${batch.name}`);
+      row.rename.disabled = !this.state.ready || this.cancellingQueue || this.cancellingBatches.has(batch.id);
       row.discard.hidden = this.state.edit?.batch_id !== batch.id;
       row.edit.textContent = this.state.edit?.batch_id === batch.id ? "Resume editing" : "Edit workflow";
       row.edit.disabled = !this.state.ready || Boolean(this.state.edit && this.state.edit.batch_id !== batch.id);

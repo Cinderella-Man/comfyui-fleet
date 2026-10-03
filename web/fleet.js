@@ -59,6 +59,7 @@ app.registerExtension({
       select,
       retry: refresh,
       editBatch: id => editor.open(id),
+      renameBatch: (id, name) => mutate(`/fleet/batches/${id}/rename`, { name }),
       discardBatchEdit: id => editor.discardBatch(id),
       cancelQueued: batch_id => mutate("/fleet/queue/cancel", batch_id == null ? {} : { batch_id }),
       reorderBatch: (batch_id, before_batch_id) => mutate("/fleet/queue/reorder", { batch_id, before_batch_id }),

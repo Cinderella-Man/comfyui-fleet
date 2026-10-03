@@ -103,6 +103,7 @@ def test_save_replaces_only_waiting_jobs_atomically_and_is_replayable(ledger):
     before = ledger.jobs()
     edit = ledger.begin_edit(value["batch_id"], str(uuid.uuid4()))
     body = prepared_edit(ledger, edit)
+    ledger.rename_batch(value["batch_id"], "Renamed during workflow editing")
     with pytest.raises(ValueError):
         ledger.commit_edit(body, [], [])
     assert ledger.jobs() == before
@@ -111,6 +112,7 @@ def test_save_replaces_only_waiting_jobs_atomically_and_is_replayable(ledger):
     assert answer["job_ids"] == ids[1:]
     assert ledger.job(active["id"]) == active
     assert ledger.edit_state() is None
+    assert ledger.state()["batch_names"][value["batch_id"]] == "Renamed during workflow editing"
     assert ledger.commit_edit(body, [], [])["replayed"]
     for index, key in enumerate(ids[1:]):
         row = ledger.job(key)

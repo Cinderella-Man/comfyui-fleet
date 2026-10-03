@@ -864,6 +864,26 @@ class Ledger:
                     self._cancel_job(row)
         return {"cancelled": sum(wanted is None or row["id"] in wanted for row in rows)}
 
+    def rename_batch(self, batch_id, name):
+        """Rename queued work without changing its source, prepared jobs, or edit hold."""
+        identity(batch_id)
+        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 200:
+            raise ValueError("Batch name must contain 1–200 characters")
+        name = name.strip()
+        if any(ord(char) < 32 or ord(char) == 127 for char in name):
+            raise ValueError("Batch name must be a single line without control characters")
+        with self.db:
+            changed = self.db.execute(
+                "UPDATE batch_progress SET name=? WHERE batch_id=? AND EXISTS "
+                "(SELECT 1 FROM jobs WHERE batch_id=? AND state='waiting' "
+                "AND worker_id IS NULL AND occupied=0 AND submit_intent=0)",
+                (name, batch_id, batch_id),
+            )
+            if not changed.rowcount:
+                raise Conflict("This batch no longer has queued jobs. Refresh the queue.")
+            self.event("batch_renamed", detail={"batch_id": batch_id, "name": name})
+        return {"batch_id": batch_id, "name": name}
+
     def reorder_batch(self, batch_id, before_batch_id):
         """Move a batch's unassigned jobs; claims and admissions use this same ledger thread."""
         identity(batch_id)

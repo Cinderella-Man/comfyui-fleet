@@ -465,6 +465,56 @@ def test_state_queue_follows_dispatch_priority(ledger):
     assert [row["id"] for row in ledger.state()["jobs"]] == [ids[-1], *ids[:-1]]
 
 
+def test_batch_name_persists_without_changing_jobs_source_order_or_edit_hold(ledger):
+    value = batch(3)
+    value["jobs"][0]["workflow"]["extra"] = {"fleet": {"workflow_name": "Original"}}
+    receipt = admit(ledger, value)
+    ledger.claim("a")
+    ledger.begin_edit(value["batch_id"], str(uuid.uuid4()))
+    jobs, hold = ledger.jobs(), ledger.edit_state()
+    revision = [tuple(row) for row in ledger.db.execute("SELECT * FROM batch_revisions")]
+    assert ledger.rename_batch(value["batch_id"], "  Finals — <v2>  ") == {
+        "batch_id": value["batch_id"],
+        "name": "Finals — <v2>",
+    }
+    assert ledger.jobs() == jobs
+    assert ledger.edit_state() == hold
+    assert [tuple(row) for row in ledger.db.execute("SELECT * FROM batch_revisions")] == revision
+    assert admit(ledger, value)["job_ids"] == receipt["job_ids"]
+    assert ledger.state()["batch_names"][value["batch_id"]] == "Finals — <v2>"
+    root = ledger.root
+    ledger.close()
+    reopened = Ledger(root)
+    try:
+        assert reopened.state()["batch_names"][value["batch_id"]] == "Finals — <v2>"
+        assert reopened.jobs() == jobs
+        assert reopened.edit_state() == hold
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("name", [None, 7, "", "   ", "x" * 201, "a\nb", "a\x00b"])
+def test_invalid_batch_names_preserve_the_existing_name(ledger, name):
+    value = batch(1)
+    admit(ledger, value)
+    ledger.rename_batch(value["batch_id"], "Original")
+    with pytest.raises(ValueError, match="Batch name"):
+        ledger.rename_batch(value["batch_id"], name)
+    assert ledger.state()["batch_names"][value["batch_id"]] == "Original"
+
+
+def test_batch_rename_rejects_a_batch_that_left_the_queue(ledger):
+    value = batch(1)
+    admit(ledger, value)
+    ledger.rename_batch(value["batch_id"], "Original")
+    ledger.claim("a")
+    with pytest.raises(Conflict, match="no longer has queued jobs"):
+        ledger.rename_batch(value["batch_id"], "Too late")
+    with pytest.raises(Conflict, match="no longer has queued jobs"):
+        ledger.rename_batch(str(uuid.uuid4()), "Missing")
+    assert ledger.state()["batch_names"][value["batch_id"]] == "Original"
+
+
 def test_batch_reorder_persists_and_preserves_assigned_and_completed_jobs(ledger):
     first, second, third = batch(4), batch(3), batch(2)
     first["jobs"][0]["workflow"]["extra"] = {"fleet": {"workflow_name": "Portraits"}}

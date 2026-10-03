@@ -38,6 +38,10 @@ These controls affect only Fleet jobs.
 
 ## Edit a queued batch
 
+Choose **⋯ → Rename batch** to change a batch's displayed name. Save keeps the
+name across browser refreshes and controller restarts. Its workflow and queue
+position stay the same, and active jobs from that batch show the new name too.
+
 Open a batch’s **⋯** menu and choose **Edit workflow**. Fleet opens a separate
 ComfyUI tab containing the original authored workflow, including prompt patterns,
 all stages and widget controls. Use **Save to batch** or **Discard changes**;

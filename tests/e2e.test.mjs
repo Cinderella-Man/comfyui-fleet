@@ -1495,3 +1495,101 @@ for (const action of ['Save to batch','Discard changes']) test(`${action} closes
   assert.deepEqual(after,before);
   assert.equal(await page.locator('.fleet-edit-bar:visible').count(),0);
 });
+
+async function openBatchRename(page, id) {
+  await page.evaluate(()=>window.comfyFleet.refresh());
+  const row=page.locator(`[data-batch-id="${id}"]`);
+  await row.locator('summary').click();
+  await row.getByRole('button',{name:'Rename batch',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'Rename batch',exact:true});
+  await dialog.waitFor();
+  return dialog;
+}
+
+test('renaming a queued batch persists, updates active cards, and preserves its jobs and position',{timeout:30000},async t=>{
+  const {page,submit,until,state,post}=await setup(t);
+  const first=await submit('Original',5);
+  const second=await submit('Other batch',2);
+  await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
+  const before=await state();
+  const dialog=await openBatchRename(page,first.batch_id);
+  const input=dialog.getByRole('textbox',{name:'Batch name',exact:true});
+  assert.equal(await input.inputValue(),'Original');
+  assert.equal(await input.evaluate(el=>el===document.activeElement),true);
+  const renamed='Finals — <v2>';
+  await input.fill(`  ${renamed}  `);
+  if(process.env.FLEET_E2E_SCREENSHOTS){
+    await mkdir(process.env.FLEET_E2E_SCREENSHOTS,{recursive:true});
+    await page.screenshot({path:join(process.env.FLEET_E2E_SCREENSHOTS,'batch-rename.png')});
+  }
+  await input.press('Enter');
+  await dialog.waitFor({state:'hidden'});
+  await until(s=>s.batch_names[first.batch_id]===renamed);
+  const queue=page.getByRole('region',{name:'Queued Fleet batches',exact:true});
+  await queue.getByText(renamed,{exact:true}).waitFor();
+  assert.deepEqual(await queue.locator('[data-batch-id]').evaluateAll(rows=>rows.map(r=>r.dataset.batchId)),[first.batch_id,second.batch_id]);
+  assert.deepEqual((await state()).jobs,before.jobs);
+  for(const number of [1,2]) await page.getByRole('region',{name:`Node ${number} activity`,exact:true}).getByText(renamed,{exact:true}).waitFor();
+  const row=queue.locator(`[data-batch-id="${first.batch_id}"]`);
+  assert.equal(await row.locator('summary').getAttribute('aria-label'),`Batch actions for ${renamed}`);
+  await row.getByRole('button',{name:'Cancel batch',exact:true}).click();
+  const cancel=page.getByRole('dialog',{name:`Cancel queued jobs in “${renamed}”?`,exact:true});
+  await cancel.getByRole('button',{name:'Keep jobs',exact:true}).click();
+  await post('/fixture',{restart:true});
+  await page.reload();
+  await queue.getByText(renamed,{exact:true}).waitFor();
+  const reopened=await openBatchRename(page,first.batch_id);
+  assert.equal(await reopened.getByRole('textbox',{name:'Batch name',exact:true}).inputValue(),renamed);
+  await reopened.getByRole('button',{name:'Cancel',exact:true}).click();
+});
+
+test('batch rename supports cancellation, validates empty names, and retains input after a failed save',{timeout:30000},async t=>{
+  const {page,submit,until,state}=await setup(t);
+  const accepted=await submit('Original',5);
+  await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
+  let dialog=await openBatchRename(page,accepted.batch_id);
+  await dialog.getByRole('textbox',{name:'Batch name',exact:true}).fill('   ');
+  assert.equal(await dialog.getByRole('button',{name:'Save',exact:true}).isDisabled(),true);
+  await dialog.press('Escape');
+  assert.equal((await state()).batch_names[accepted.batch_id],'Original');
+  dialog=await openBatchRename(page,accepted.batch_id);
+  const input=dialog.getByRole('textbox',{name:'Batch name',exact:true});
+  await input.fill('Retry this name');
+  let release,received,requests=0;
+  const held=new Promise(resolve=>{release=resolve});
+  const seen=new Promise(resolve=>{received=resolve});
+  t.after(()=>release());
+  await page.route('**/fleet/batches/*/rename',async route=>{
+    if(++requests===1)return route.abort('failed');
+    received();await held;await route.continue();
+  });
+  await dialog.getByRole('button',{name:'Save',exact:true}).click();
+  await dialog.getByRole('alert').getByText(/^Could not rename batch\./).waitFor();
+  assert.equal(await input.inputValue(),'Retry this name');
+  assert.equal((await state()).batch_names[accepted.batch_id],'Original');
+  await dialog.getByRole('button',{name:'Save',exact:true}).click();
+  await seen;
+  assert.equal(await dialog.getByRole('button',{name:'Saving…',exact:true}).isDisabled(),true);
+  assert.equal(await dialog.getByRole('button',{name:'Cancel',exact:true}).isDisabled(),true);
+  await dialog.press('Escape');
+  assert.equal(await dialog.isVisible(),true);
+  release();
+  await dialog.waitFor({state:'hidden'});
+  assert.equal((await state()).batch_names[accepted.batch_id],'Retry this name');
+  assert.equal(requests,2);
+});
+
+test('batch rename rejects stale queue entries and malformed names through the HTTP API',{timeout:30000},async t=>{
+  const {page,submit,until,state,post}=await setup(t,{nodeCount:1});
+  const accepted=await submit('Original',2);
+  const initial=await until(s=>s.jobs.some(j=>j.acknowledged));
+  const url=new URL(`/fleet/batches/${accepted.batch_id}/rename`,page.url()).href;
+  for(const data of [{name:''},{name:'x'.repeat(201)},{name:null},{name:'first\nsecond'},{}]) {
+    assert.equal((await page.request.post(url,{data})).status(),400);
+  }
+  const active=initial.jobs.find(j=>j.acknowledged);
+  await post('/fixture',{worker:active.worker_id,complete:active.remote_id});
+  await until(s=>!s.jobs.some(j=>j.state==='waiting'));
+  assert.equal((await page.request.post(url,{data:{name:'Too late'}})).status(),409);
+  assert.equal((await state()).batch_names[accepted.batch_id],'Original');
+});

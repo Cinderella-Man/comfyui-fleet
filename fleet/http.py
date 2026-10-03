@@ -62,6 +62,7 @@ class Routes:
             ("POST", "/edit/discard", self.discard_edit),
             ("POST", "/edit/save", self.save_edit),
             ("GET", "/batches/{batch_id}", self.batch),
+            ("POST", "/batches/{batch_id}/rename", self.rename_batch),
             ("POST", "/batches/{batch_id}/cancel", self.cancel_batch),
             ("POST", "/batches/{batch_id}/reenable", self.reenable),
             ("POST", "/jobs/cancel", self.cancel),
@@ -200,6 +201,16 @@ class Routes:
         if result is None:
             raise web.HTTPNotFound()
         return web.json_response(result)
+
+    async def rename_batch(self, request):
+        data = await body(request)
+        if not isinstance(data, dict) or data.keys() != {"name"}:
+            raise ValueError("Expected a batch name")
+        return web.json_response(
+            await self.ready().store.call(
+                "rename_batch", request.match_info["batch_id"], data["name"]
+            )
+        )
 
     async def cancel_batch(self, request):
         await body(request)
