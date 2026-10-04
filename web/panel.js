@@ -11,7 +11,7 @@ const pageSize = 10;
 
 export function jobStatus(job) {
   if (!terminal.has(job.state) && job.cancel_requested) return "Cancelling";
-  if (job.state === "unknown") return "Needs review";
+  if (job.state === "unknown") return job.occupied ? "Checking job" : "Cancelled";
   if (job.collection_state === "error") return "Results need attention";
   if (terminal.has(job.state) && job.collection_state === "pending") return "Saving results";
   return { waiting: "Queued", preparing: "Preparing", outstanding: "In progress",
@@ -19,6 +19,7 @@ export function jobStatus(job) {
 }
 
 function needsAttention(job) {
+  if (job.state === "unknown" && !job.occupied) return false;
   return !terminal.has(job.state) || job.occupied || ["pending", "error"].includes(job.collection_state);
 }
 
@@ -409,7 +410,7 @@ export class FleetPanel {
     this.cancelQueueButton.addEventListener("click", () => this.cancelQueued());
     queueHeading.append(queueTitle, this.cancelQueueButton);
     this.queueHint = element("p", null, { className: "fleet-queue-hint" });
-    this.queueBody = element("div", null, { className: "fleet-queue-scroll" });
+    this.queueBody = element("div", null, { className: "fleet-queue-body" });
     this.queueList = element("ol", null, { className: "fleet-queue-list" });
     this.queueEmpty = element("p", "No batches waiting", { className: "fleet-queue-empty" });
     this.queueBody.append(this.queueList, this.queueEmpty);
@@ -427,7 +428,7 @@ export class FleetPanel {
     const nodeDragHelp = element("span", "Press Space to pick up a node, use arrow keys to move it, then Space to save. Escape cancels.", { className: "fleet-sr-only", id: "fleet-node-drag-help" });
     const orderingDisabled = () => this.editing || this.workerSaving || this.cancellingActive || this.cancellingQueuedJobs || !this.state?.ready;
     const renderOrder = () => { this.renderQueue(); this.renderWorkers(); };
-    this.queueOrder = new ReorderList({ list: this.queueList, scroller: this.queueBody, rows: this.queueRows,
+    this.queueOrder = new ReorderList({ list: this.queueList, scroller: this.root, rows: this.queueRows,
       key: "batchId", subject: "Batch", plural: "batches", descriptionId: "fleet-drag-help",
       isDisabled: () => Boolean(this.state?.edit) || orderingDisabled() || this.workerOrder.busy, render: renderOrder,
       announce: (text, error) => this.queueMessage(text, error),
@@ -640,7 +641,7 @@ export class FleetPanel {
       .fleet-panel .fleet-queue-count{font-size:11px;color:var(--fleet-muted);font-weight:400}
       .fleet-panel .fleet-queue-heading button{font-size:11px;padding:5px 8px;min-height:30px}
       .fleet-panel .fleet-queue-hint{font-size:12px;line-height:1.65;color:var(--fleet-muted);margin:0 0 12px}
-      .fleet-panel .fleet-queue-scroll{max-height:48vh;overflow-y:auto;overscroll-behavior:contain;padding:3px;margin:-3px;scrollbar-width:thin}
+      .fleet-panel .fleet-queue-body{padding:3px;margin:-3px}
       .fleet-panel .fleet-queue-list{list-style:none;margin:0;padding:0;display:grid;gap:8px}
       .fleet-panel .fleet-batch{position:relative;display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;gap:10px;padding:12px 10px;border:1px solid var(--fleet-line);border-radius:10px;background:var(--fleet-surface)}
       .fleet-panel .fleet-batch strong{display:block;font-size:12px;font-weight:550;overflow-wrap:anywhere;line-height:1.5}
@@ -1219,10 +1220,9 @@ export class FleetPanel {
       const error = element("p", this.jobCancellationErrors.get(job.id));
       error.setAttribute("role", "alert"); recovery.append(error);
     }
-    if (job.error) recovery.append(element("p", job.error));
+    if (job.error && job.state !== "unknown") recovery.append(element("p", job.error));
     if (job.state === "unknown" && job.occupied) {
-      recovery.append(element("p", "The outcome is uncertain. Verify the worker is idle before releasing its reserved slot."),
-        this.button("Verify inactivity and release worker", () => this.actions.jobAction(job.id, "release")));
+      recovery.append(element("p", "Fleet is checking this job. If the node no longer has it, it will be dropped and queued work will continue."));
     }
     if (job.collection_state === "error") {
       recovery.append(element("p", "Retry saving the results without executing the workflow again."),
@@ -1276,7 +1276,7 @@ export class FleetPanel {
   }
 
   renderCancellation() {
-    // An unknown job whose slot was manually released is retained for review, not running.
+    // Legacy unknown jobs whose slots were released are no longer active.
     const active = this.state.jobs.filter(job => !terminal.has(job.state) && job.occupied);
     const remaining = active.filter(job => !job.cancel_requested);
     this.cancelActiveButton.disabled = this.cancellingActive || this.cancellingJobs.size > 0 || this.cancellingQueuedJobs || this.queueOrder.busy || this.workerOrder.busy || !remaining.length || !this.state.ready;
@@ -1430,7 +1430,7 @@ export class FleetPanel {
       renderBatchProgress(row, batch);
       row.status.textContent = [batch.active && `${batch.active} active`, `${batch.queued} queued`,
         batch.failed && `${batch.failed} failed`, batch.cancelled && `${batch.cancelled} cancelled`,
-        batch.review && `${batch.review} need review`].filter(Boolean).join(" · ");
+        batch.review && `${batch.review} checking`].filter(Boolean).join(" · ");
     });
   }
 

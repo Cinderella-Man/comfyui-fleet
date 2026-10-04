@@ -401,22 +401,16 @@ class Controller:
         return await self.store.call("active_identity", worker, remote_id)
 
     async def release_unknown(self, job_id):
+        # Older browser sessions can still request a check. Missing jobs now
+        # release capacity automatically through the ordinary observation path.
         row = await self.store.call("job", job_id)
-        if row is None or row["state"] != "unknown":
-            raise Conflict("Only unknown outcomes can be manually reconciled")
+        if row is None:
+            raise Conflict("This job is no longer available")
+        if row["state"] != "unknown" or not row["occupied"]:
+            return {"resolved": row["state"]}
         await self.observe(row)
         row = await self.store.call("job", job_id)
-        if row["state"] != "unknown":
-            return {"resolved": row["state"]}
-        queue = await self.remote.get(row["worker_url"], "/queue")
-        if any(
-            item[1] == row["remote_id"]
-            for k in ("queue_running", "queue_pending")
-            for item in queue[k]
-        ):
-            raise Conflict("The exact job is still queued or executing")
-        await self.store.call("release_unknown", job_id)
-        return {"released": True, "outcome": "unknown"}
+        return {"resolved": row["state"]}
 
     async def on_event(self, worker, kind, data):
         if kind not in EXECUTION_EVENTS or not isinstance(data, dict):

@@ -148,6 +148,17 @@ class Ledger:
                         "AND worker_id IS NULL AND occupied=0 AND submit_intent=0",
                         (time.time(),),
                     )
+                # Older versions released missing jobs without resolving their
+                # outcome. Treat those already-free slots as dropped work too.
+                self.db.execute(
+                    "UPDATE jobs SET state='cancelled',ended=COALESCE(ended,?),"
+                    "collection_state='not_applicable',error=NULL "
+                    "WHERE state='unknown' AND occupied=0",
+                    (time.time(),),
+                )
+                self.db.execute(
+                    "UPDATE batch_progress SET cancelled=cancelled+review,review=0 WHERE review>0"
+                )
                 self.db.execute("PRAGMA user_version=3")
             if (self.root / "restore-pause").exists():
                 self.pause(True)
@@ -680,16 +691,6 @@ class Ledger:
             )
         ]
 
-    def release_unknown(self, job_id):
-        with self.db:
-            row = self.job(job_id)
-            if row["state"] != "unknown" or not (row["acknowledged"] or row["observed"]):
-                raise Conflict("Cannot release a submission that may still arrive")
-            self.db.execute(
-                "UPDATE jobs SET occupied=0,collection_state='unavailable' WHERE id=?", (job_id,)
-            )
-            self.event("manual_capacity_release", job_id)
-
     def claim(self, worker):
         with self.db:
             busy = self.db.execute(
@@ -842,10 +843,18 @@ class Ledger:
             )
             if not present and (cancel_ack or row["cancel_ack"]):
                 self._terminal(row, "cancelled")
-            elif not present and (row["acknowledged"] or row["observed"]):
+            elif not present:
+                # A reachable node has neither a queue entry nor history for this
+                # identity. Accept losing that job after a restart, without
+                # retrying it or suspending the remaining batch on this node.
+                self._terminal(
+                    row,
+                    "cancelled",
+                    error="Node no longer reports this job; dropped without retry.",
+                )
+            elif row["state"] == "unknown":
                 self.db.execute(
-                    "UPDATE jobs SET state='unknown',error=? WHERE id=?",
-                    ("Worker no longer reports this job; outcome requires reconciliation", job_id),
+                    "UPDATE jobs SET state='outstanding',error=NULL WHERE id=?", (job_id,)
                 )
 
     def cancel_queued(self, batch_id=None, job_ids=None):

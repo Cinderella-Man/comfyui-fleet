@@ -41,6 +41,8 @@
 !/docs/adr/0001-edit-queued-jobs-within-their-batch.md
 !/docs/adr/0002-editing-holds-the-queue-at-the-edited-batch.md
 !/docs/adr/0003-share-prepared-job-data-within-batch-revisions.md
+!/docs/adr/0004-resize-batches-without-replaying-prepared-work.md
+!/docs/adr/0005-drop-missing-jobs-after-node-restarts.md
 !/tests/
 /tests/*
 !/tests/conftest.py

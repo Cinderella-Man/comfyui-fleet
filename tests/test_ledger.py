@@ -170,7 +170,10 @@ def test_crash_after_intent_never_allows_second_post(ledger):
         assert row["id"] == a["id"] and row["submit_intent"] == 1
         assert not recovered.begin_submit(row["id"])
         recovered.observe(row["id"], False)
-        assert recovered.job(row["id"])["occupied"] == 1
+        assert recovered.job(row["id"])["state"] == "cancelled"
+        assert recovered.job(row["id"])["occupied"] == 0
+        assert not recovered.begin_submit(row["id"])
+        assert recovered.claim("a")["id"] != row["id"]
     finally:
         recovered.close()
 
@@ -183,7 +186,7 @@ def test_cancellation_preparation_and_late_admission(ledger):
     a = ledger.claim("a")
     assert ledger.begin_submit(a["id"])
     ledger.cancel([a["id"]])
-    ledger.observe(a["id"], False, False)  # still validating remotely
+    # Cancellation while the submission request is still in flight only sets intent.
     assert ledger.job(a["id"])["occupied"]
     ledger.submitted(a["id"], 200, {"prompt_id": a["remote_id"]})
     ledger.observe(a["id"], True, True)  # interrupt was signalled, still running
@@ -412,19 +415,17 @@ def test_cancel_everything_preserves_results_and_waits_for_active_acknowledgemen
     assert not ledger.paused()
 
 
-def test_cancel_everything_includes_unknown_occupied_jobs_but_not_released_outcomes(ledger):
+def test_cancel_everything_includes_uncertain_jobs_but_not_dropped_jobs(ledger):
     admit(ledger, batch(2))
     for worker in ("a", "b"):
         row = ledger.claim(worker)
         ledger.begin_submit(row["id"])
         ledger.submitted(row["id"], None, {})
-        ledger.observe(row["id"], True)
-        ledger.observe(row["id"], False)
-    ledger.release_unknown(row["id"])
-    released = ledger.job(row["id"])
+    ledger.observe(row["id"], False)
+    dropped = ledger.job(row["id"])
     assert ledger.cancel_all() == {"cancelled": 1}
     assert ledger.claim("a")["cancel_requested"]
-    assert ledger.job(row["id"]) == released
+    assert ledger.job(row["id"]) == dropped
 
 
 def test_cancel_everything_handles_more_than_one_batch_of_1000_jobs(ledger):
@@ -616,12 +617,11 @@ def test_cancel_batch_preserves_later_batch_and_completed_outputs(ledger):
     assert ledger.claim("a")["batch_id"] == second["batch_id"]
 
 
-def test_unknown_stays_reserved_and_configuration_cannot_orphan_it(ledger):
+def test_unchecked_submission_stays_reserved_and_configuration_cannot_orphan_it(ledger):
     admit(ledger, batch(2))
     a = ledger.claim("a")
     ledger.begin_submit(a["id"])
     ledger.submitted(a["id"], None, {})
-    ledger.observe(a["id"], False)
     assert ledger.claim("a")["id"] == a["id"]
     with pytest.raises(Conflict):
         ledger.action(a["id"], "retry")
@@ -700,19 +700,19 @@ def test_sqlite_full_rolls_back_entire_batch_and_recovers(tmp_path):
         store.close()
 
 
-def test_manual_capacity_release_requires_settled_submission(ledger):
+def test_observed_submission_clears_uncertainty_then_drops_if_it_disappears(ledger):
     admit(ledger, batch(1))
     row = ledger.claim("a")
     ledger.begin_submit(row["id"])
     ledger.submitted(row["id"], None, {})
-    with pytest.raises(Conflict):
-        ledger.release_unknown(row["id"])
-    ledger.observe(row["id"], True)
-    ledger.observe(row["id"], False)
-    ledger.release_unknown(row["id"])
     assert ledger.job(row["id"])["state"] == "unknown"
+    ledger.observe(row["id"], True)
+    assert ledger.job(row["id"])["state"] == "outstanding"
+    assert ledger.job(row["id"])["error"] is None
+    ledger.observe(row["id"], False)
+    assert ledger.job(row["id"])["state"] == "cancelled"
     assert ledger.job(row["id"])["occupied"] == 0
-    assert ledger.job(row["id"])["collection_state"] == "unavailable"
+    assert ledger.job(row["id"])["collection_state"] == "not_applicable"
 
 
 def test_successful_collection_retry_clears_transfer_error_only(ledger):

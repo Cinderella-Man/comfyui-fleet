@@ -20,6 +20,185 @@ import fleet.worker as worker_module
 from test_ledger import batch, history
 
 
+@pytest.mark.parametrize("receipt", ["acknowledged", "observed", "unconfirmed", "interrupted"])
+@pytest.mark.parametrize("restart_controller", [False, True])
+def test_returning_nodes_drop_missing_jobs_and_continue_queue(
+    tmp_path, receipt, restart_controller
+):
+    async def scenario():
+        store = Store(tmp_path / "state")
+        await store.open()
+        workers = ["a", "b", "c"]
+
+        class ReturningNodes:
+            online = False
+
+            async def get(self, url, path):
+                if not self.online:
+                    raise OSError("Node is offline")
+                if path.startswith("/history/"):
+                    return {}
+                assert path == "/queue"
+                return {"queue_running": [], "queue_pending": []}
+
+            async def request(self, *args):
+                if args[1].startswith("/api/jobs/") and args[1].endswith("/cancel"):
+                    return 200, {"cancelled": False}
+                pytest.fail("Reconciliation must never resubmit the missing job")
+
+        remote = ReturningNodes()
+        try:
+            await store.call(
+                "configure",
+                [
+                    {"id": worker, "url": f"http://127.0.0.{index + 1}:8188"}
+                    for index, worker in enumerate(workers)
+                ],
+            )
+            value = batch(9)
+            accepted = await store.call("admit", value, [[]] * 9, [workers] * 9)
+            active = []
+            for worker in workers:
+                row = await store.call("claim", worker)
+                await store.call("begin_submit", row["id"])
+                if receipt == "interrupted":
+                    # The controller stopped before recording the submission's
+                    # outcome. Cancelling the missing remote identity returns false.
+                    await store.call("cancel", [row["id"]])
+                else:
+                    await store.call(
+                        "submitted",
+                        row["id"],
+                        200 if receipt == "acknowledged" else None,
+                        {"prompt_id": row["remote_id"]} if receipt == "acknowledged" else {},
+                    )
+                if receipt == "observed":
+                    await store.call("observe", row["id"], True)
+                active.append(await store.call("job", row["id"]))
+            waiting_ids = set(accepted["job_ids"]) - {row["id"] for row in active}
+            if restart_controller:
+                await store.close()
+                store = Store(tmp_path / "state")
+                await store.open()
+            control = Controller(store, remote, None, lambda event: None)
+            for row in active:
+                with pytest.raises(OSError, match="offline"):
+                    await control.observe(row)
+                assert (await store.call("job", row["id"]))["occupied"] == 1
+            assert {
+                row["id"]
+                for row in (await store.call("state"))["jobs"]
+                if row["state"] == "waiting"
+            } == waiting_ids
+
+            remote.online = True
+            for row in active:
+                await control.observe(row)
+                dropped = await store.call("job", row["id"])
+                assert dropped["state"] == "cancelled"
+                assert dropped["occupied"] == 0 and dropped["ended"] is not None
+                assert dropped["collection_state"] == "not_applicable"
+                assert not await store.call("begin_submit", row["id"])
+                await store.call("finish", row["id"], history())
+                assert await store.call("job", row["id"]) == dropped
+            state = await store.call("state")
+            assert state["suspensions"] == []
+            assert state["batch_counts"][value["batch_id"]]["cancelled"] == 3
+            assert {row["id"] for row in state["jobs"] if row["state"] == "waiting"} == waiting_ids
+            for worker in workers:
+                next_job = await store.call("claim", worker)
+                assert next_job["id"] in waiting_ids
+                waiting_ids.remove(next_job["id"])
+            await store.call("prune")
+            assert (await store.call("state"))["batch_counts"][value["batch_id"]]["cancelled"] == 3
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "reported",
+    [
+        "running",
+        "pending",
+        "history",
+        "history_race",
+        "offline",
+        "queue_error",
+        "second_history_error",
+    ],
+)
+def test_reconciliation_preserves_reported_jobs_and_waits_for_complete_checks(tmp_path, reported):
+    async def scenario():
+        store = Store(tmp_path / "state")
+        await store.open()
+        try:
+            await store.call("configure", [{"id": "one", "url": "http://127.0.0.1:8188"}])
+            await store.call("admit", batch(2), [[], []], [["one"], ["one"]])
+            active = await store.call("claim", "one")
+            await store.call("begin_submit", active["id"])
+            await store.call("submitted", active["id"], None, {})
+
+            class Reports:
+                reads = 0
+
+                async def get(self, url, path):
+                    if reported == "offline":
+                        raise OSError("Node is offline")
+                    if path.startswith("/history/"):
+                        self.reads += 1
+                        if reported == "second_history_error" and self.reads == 2:
+                            raise OSError("History check failed")
+                        if reported == "history" or reported == "history_race" and self.reads == 2:
+                            return {active["remote_id"]: history()}
+                        return {}
+                    assert path == "/queue"
+                    if reported == "queue_error":
+                        raise OSError("Queue check failed")
+                    return {
+                        "queue_running": [[0, active["remote_id"]]]
+                        if reported == "running"
+                        else [],
+                        "queue_pending": [[0, active["remote_id"]]]
+                        if reported == "pending"
+                        else [],
+                    }
+
+            remote = Reports()
+            control = Controller(store, remote, None, lambda event: None)
+            if reported in {"offline", "queue_error", "second_history_error"}:
+                with pytest.raises(OSError):
+                    await control.observe(active)
+            else:
+                await control.observe(active)
+            row = await store.call("job", active["id"])
+            if reported in {"history", "history_race"}:
+                assert row["state"] == "succeeded" and row["occupied"] == 0
+                assert row["collection_state"] == "pending"
+            else:
+                assert row["occupied"] == 1
+                assert row["state"] == (
+                    "outstanding" if reported in {"running", "pending"} else "unknown"
+                )
+            assert (
+                len(
+                    [
+                        job
+                        for job in (await store.call("state"))["jobs"]
+                        if job["state"] == "waiting"
+                    ]
+                )
+                == 1
+            )
+            if reported == "history_race":
+                assert remote.reads == 2
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
 def test_worker_releases_delivered_event_while_waiting_for_next_message(monkeypatch):
     async def scenario():
         waiting = asyncio.Event()

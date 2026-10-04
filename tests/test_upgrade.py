@@ -15,6 +15,57 @@ from fleet.validation import canonical
 from test_ledger import batch, history
 
 
+def test_previously_released_jobs_become_cancelled_without_releasing_unchecked_work(tmp_path):
+    root = tmp_path / "state"
+    store = Ledger(root)
+    try:
+        store.configure(
+            [
+                {"id": worker, "url": f"http://127.0.0.{i + 1}:8188"}
+                for i, worker in enumerate(("a", "b"))
+            ]
+        )
+        value = batch(5)
+        store.admit(value, [[]] * 5, [["a", "b"]] * 5)
+
+        def old_released_job():
+            row = store.claim("a")
+            store.begin_submit(row["id"])
+            store.submitted(row["id"], None, {})
+            with store.db:
+                store.db.execute(
+                    "UPDATE jobs SET occupied=0,collection_state='unavailable' WHERE id=?",
+                    (row["id"],),
+                )
+            return row["id"]
+
+        old_released_job()
+        store.prune()  # One released outcome only remains in durable batch counts.
+        released = old_released_job()
+        active = store.claim("a")
+        store.begin_submit(active["id"])
+        store.submitted(active["id"], None, {})
+        waiting = {job["id"] for job in store.waiting_jobs()}
+        assert len(waiting) == 2
+        store.close()
+
+        for _ in range(2):
+            store = Ledger(root)
+            assert store.job(active["id"])["state"] == "unknown"
+            assert store.job(active["id"])["occupied"] == 1
+            assert {job["id"] for job in store.waiting_jobs()} == waiting
+            counts = store.state()["batch_counts"][value["batch_id"]]
+            assert counts == {"total": 5, "completed": 0, "failed": 0, "cancelled": 2, "review": 1}
+            if store.job(released):
+                assert store.job(released)["state"] == "cancelled"
+                assert store.job(released)["ended"] is not None
+                assert store.job(released)["collection_state"] == "not_applicable"
+            store.prune()
+            store.close()
+    finally:
+        store.close()
+
+
 def legacy_ledger(root):
     root.mkdir()
     value = batch(4)

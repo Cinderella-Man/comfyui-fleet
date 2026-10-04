@@ -92,7 +92,7 @@ test("node activity omits finished history and other nodes but preserves work ne
     job("hidden", { hidden: true }),
     ...Array.from({ length: 200 }, (_, i) => job(`done-${i}`, { created: i + 2 }))];
   assert.deepEqual(new Set(workerJobs(jobs, "node-1").map(job => job.id)),
-    new Set(["unknown", "collecting", "save-error", "working"]));
+    new Set(["collecting", "save-error", "working"]));
 });
 
 test("the queue preserves server priority and excludes any assigned or completed work", () => {
@@ -148,7 +148,8 @@ test("cancelled unassigned jobs are cancelled, while incomplete outputs need att
   assert.equal(jobStatus({ state: "cancelled", worker_id: null, collection_state: "not_applicable" }), "Cancelled");
   assert.equal(jobStatus({ state: "succeeded", collection_state: "pending" }), "Saving results");
   assert.equal(jobStatus({ state: "succeeded", collection_state: "error" }), "Results need attention");
-  assert.equal(jobStatus({ state: "unknown", occupied: 0 }), "Needs review");
+  assert.equal(jobStatus({ state: "unknown", occupied: 0 }), "Cancelled");
+  assert.equal(jobStatus({ state: "unknown", occupied: 1 }), "Checking job");
 });
 
 test("native Run constructs distinct batch IDs on plain HTTP without randomUUID", () => {

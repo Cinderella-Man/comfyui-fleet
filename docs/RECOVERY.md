@@ -32,11 +32,27 @@ their required nodes. Resolve that work in Fleet before retrying the restore.
 
 Leave `<ComfyUI user directory>/fleet` intact. Waiting jobs survive an ordinary restart (see the [0.2.0 upgrade reset](INSTALL.md#upgrade-to-020)),
 and Fleet reconnects to remote workers to check work already assigned.
-It never automatically reruns a job whose outcome is uncertain.
+It never automatically reruns interrupted work.
 
 If the controller also uses its own GPU, restarting ComfyUI can interrupt that
 job. Remote workers can keep running. Closing the browser does not stop assigned jobs. An open batch edit keeps its
 queue hold until you resume editing and choose Save or Discard.
+
+## Restart or power off nodes
+
+You can restart nodes without stopping the queue first. While a node is
+unreachable, Fleet keeps its assigned job reserved. When it returns, Fleet
+checks that job in the node's queue and history. If the job is still reported,
+Fleet continues tracking it or collects its results. If it is missing from
+both, Fleet drops it, records it as **Cancelled**, and lets the node take the
+next queued job automatically. No manual verification or release is needed.
+
+This accepts losing the jobs that were interrupted, typically one per active
+node. Waiting jobs stay queued. Dropped jobs are not retried and do not stop
+the node from accepting the rest of their batch. A connection failure alone
+does not drop a job; the node must respond to the queue and history checks.
+Jobs already manually released by an older Fleet version are counted as
+cancelled when the updated controller starts.
 
 ## Troubleshooting
 
@@ -45,7 +61,7 @@ queue hold until you resume editing and choose Save or Discard.
 | Worker cannot be reached | Check its address, port and network access from the controller. See [installation](INSTALL.md#connect-your-workers). |
 | Job failed | Fix the workflow or worker, then use **Re-enable batch** to let that worker take remaining jobs from the batch. Use **Run** to submit the failed job again if needed. |
 | Results could not be saved | Fix connectivity or storage, then choose **Retry saving results**. This downloads results without executing the workflow again. |
-| Job says **Needs review** | Check the worker before submitting replacement work. If the job has stopped, try **Verify inactivity and release worker**. Fleet keeps the slot reserved if it cannot verify that release is safe. |
+| Job says **Checking job** | Fleet checks it automatically. Restore the node's connectivity if it is offline; a job missing from its queue and history will be dropped so queued work can continue. |
 | Queue held for editing | Open the batch’s ⋯ menu, choose **Resume editing**, then Save or Discard. Closing a browser does not release this hold. |
 | Storage error stops scheduling | Check disk space and permissions, then restart with the same state directory. Do not delete the database to clear the error. |
 

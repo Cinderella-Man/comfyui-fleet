@@ -62,6 +62,38 @@ async function setup(t, {nodeCount=2,toast="native"}={}) {
   return {page,post,state,fixture,submit,until};
 }
 
+test("powering off all nodes drops only their interrupted jobs and automatically resumes queued work", {timeout:45000}, async t => {
+  const {page,post,state,fixture,submit,until}=await setup(t,{nodeCount:3});
+  const batch=await submit("Restart recovery",9);
+  const before=await until(s=>s.jobs.filter(job=>job.occupied&&job.acknowledged).length===3);
+  const interrupted=before.jobs.filter(job=>job.occupied);
+  const ids=new Set(interrupted.map(job=>job.id));
+  const waitingIds=new Set(before.jobs.filter(job=>job.state==="waiting").map(job=>job.id));
+  assert.equal(waitingIds.size,6);
+
+  await post('/fixture',{nodes_online:false});
+  await until(s=>Object.keys(s.health).length===3&&Object.values(s.health).every(node=>node.reachable===false));
+  const offline=await state();
+  assert.deepEqual(new Set(offline.jobs.filter(job=>job.occupied).map(job=>job.id)),ids);
+  assert.deepEqual(new Set(offline.jobs.filter(job=>job.state==="waiting").map(job=>job.id)),waitingIds);
+  await post('/fixture',{restart:true});
+  await post('/fixture',{nodes_online:true});
+  const resumed=await until(s=>s.batch_counts[batch.batch_id]?.cancelled===3&&
+    s.jobs.filter(job=>job.occupied&&job.acknowledged&&!ids.has(job.id)).length===3);
+  assert.equal(resumed.suspensions.length,0);
+  assert.equal(resumed.jobs.filter(job=>job.state==="waiting").length,3);
+  assert.equal(resumed.jobs.filter(job=>job.state==="unknown").length,0);
+  assert(resumed.jobs.filter(job=>job.occupied).every(job=>waitingIds.has(job.id)));
+  const nodes=await fixture();
+  for(const job of interrupted){
+    assert(!nodes[job.worker_id].pending.includes(job.remote_id),"Interrupted work must not be resubmitted");
+  }
+  await page.evaluate(()=>window.comfyFleet.refresh());
+  for(const id of ids) assert.equal(await page.locator(`.fleet-job[data-job-id="${id}"]`).count(),0);
+  assert.equal(await page.getByText('Needs review',{exact:true}).count(),0);
+  assert.equal(await page.getByRole('button',{name:'Verify inactivity and release worker',exact:true}).count(),0);
+});
+
 test("explicit interrupt cancels the requested job while another job is selected", {timeout:30000}, async t => {
   const {page,submit,until,state}=await setup(t);
   await submit("landscaping",2);

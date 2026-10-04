@@ -100,6 +100,7 @@ async def serve(app):
 
 class Worker:
     def __init__(self):
+        self.online = True
         self.pending = {"native-job": {}}
         self.history = {}
         self.cancelled = []
@@ -108,6 +109,8 @@ class Worker:
         self.allow_cancel.set()
 
     async def handle(self, request):
+        if not self.online:
+            raise web.HTTPServiceUnavailable(text="Node is powered off")
         path = request.path
         if path == "/system_stats":
             answer = {
@@ -231,6 +234,14 @@ async def main(root, node_count):
             nonlocal control, store
             if request.method == "POST":
                 data = await request.json()
+                if "nodes_online" in data:
+                    for worker in workers.values():
+                        worker.online = data["nodes_online"]
+                        if not worker.online:
+                            worker.pending.clear()
+                            worker.history.clear()
+                            for socket in tuple(worker.sockets):
+                                await socket.close()
                 if "native_history" in data:
                     native_history.update({job["id"]: job for job in data["native_history"]})
                 if "event" in data:
