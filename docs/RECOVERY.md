@@ -71,7 +71,9 @@ Fleet keeps job prompts, workflows and input copies on disk while needed for
 queued or unfinished work, uncertain outcomes, or result collection. Finished
 job records and unused input copies are removed automatically. Authored source and a shared prepared base are kept per batch revision; each job
 stores an independent lossless diff, with a full snapshot when smaller. Edit
-drafts persist until saved or discarded. Small submission and edit
+drafts persist until saved or discarded. A separate preparation checkpoint
+allows batch growth to continue native generation controls. It is removed once
+the batch has no retained jobs. Small submission and edit
 receipts containing IDs and a settings digest remain to prevent duplicate jobs
 when a browser retries a request.
 

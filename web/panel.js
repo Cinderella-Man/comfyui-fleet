@@ -646,7 +646,7 @@ export class FleetPanel {
       .fleet-panel .fleet-batch{position:relative;display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;gap:10px;padding:12px 10px;border:1px solid var(--fleet-line);border-radius:10px;background:var(--fleet-surface)}
       .fleet-panel .fleet-batch strong{display:block;font-size:12px;font-weight:550;overflow-wrap:anywhere;line-height:1.5}
       .fleet-panel .fleet-batch small{display:block;font-size:10px;line-height:1.5;color:var(--fleet-muted);margin-top:3px}
-      .fleet-panel .fleet-batch-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}
+      .fleet-panel .fleet-batch-heading>strong{min-width:0;overflow-wrap:anywhere}.fleet-panel .fleet-batch-heading>strong input{margin:0}.fleet-panel .fleet-batch-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .fleet-batch-menu{position:relative;flex:none}
 .fleet-batch-menu summary{cursor:pointer;list-style:none;font-size:22px;padding:0 6px;border-radius:5px}
 .fleet-batch-menu[open] summary{background:var(--comfy-input-bg,#333)}
@@ -1118,52 +1118,40 @@ export class FleetPanel {
     });
   }
 
-  renameBatch(batch, opener) {
-    if (this.confirmation || !this.state.ready) return;
-    const dialog = element("dialog", null, { className: "fleet-confirm" });
-    dialog.setAttribute("aria-labelledby", "fleet-rename-title");
-    const form = element("form");
-    const field = element("label", "Batch name", { className: "fleet-rename-field" });
-    const input = element("input", null, { type: "text", value: batch.name, maxLength: 200, required: true });
-    field.append(input);
-    const error = element("p", null, { className: "fleet-rename-error", hidden: true });
-    error.setAttribute("role", "alert");
-    const cancel = element("button", "Cancel", { type: "button" });
-    const save = element("button", "Save", { type: "submit", className: "fleet-primary" });
-    const footer = element("footer");
-    footer.append(cancel, save);
-    form.append(element("h3", "Rename batch", { id: "fleet-rename-title" }), field, error, footer);
-    dialog.append(form);
-    this.root.append(dialog);
+  renameInline(row) {
+    if (row.renaming || !this.state.ready) return;
+    row.renaming = true;
+    const input = element("input", null, { type: "text", value: row.batch.name, maxLength: 200 });
+    input.setAttribute("aria-label", "Batch name");
+    row.name.replaceChildren(input);
     let busy = false, closed = false;
     const finish = () => {
-      if (closed) return;
-      closed = true; this.confirmation = null;
-      dialog.close(); dialog.remove(); opener?.focus();
+      closed = true; row.renaming = false;
+      row.name.textContent = row.batch.name;
     };
-    this.confirmation = { cancel: finish };
-    input.addEventListener("input", () => { save.disabled = !input.value.trim(); error.hidden = true; });
-    cancel.addEventListener("click", finish);
-    dialog.addEventListener("cancel", event => { event.preventDefault(); if (!busy) finish(); });
-    dialog.addEventListener("close", finish);
-    form.addEventListener("submit", async event => {
-      event.preventDefault();
-      if (busy || !input.value.trim()) return;
-      busy = true; input.disabled = cancel.disabled = save.disabled = true;
-      save.textContent = "Saving…"; error.hidden = true;
-      try {
-        await this.actions.renameBatch(batch.id, input.value.trim());
-        finish();
-        this.notify("Batch name saved.");
-      } catch (failure) {
-        error.textContent = `Could not rename batch. ${failure.message}`;
-        error.hidden = false;
-      } finally {
-        busy = false; input.disabled = cancel.disabled = save.disabled = false;
-        save.textContent = "Save";
+    const save = async () => {
+      if (busy || closed) return;
+      if (!input.value.trim()) {
+        input.setAttribute("aria-invalid", "true");
+        this.queueMessage("Batch name cannot be empty.", true);
+        return;
       }
+      if (input.value.trim() === row.batch.name) { finish(); return; }
+      busy = true; input.disabled = true;
+      try {
+        await this.actions.renameBatch(row.batch.id, input.value.trim());
+        finish(); this.queueMessage("");
+      } catch (error) {
+        this.queueMessage(`Could not rename batch. ${error.message}`, true);
+      } finally { busy = false; input.disabled = false; }
+    };
+    input.addEventListener("blur", save);
+    input.addEventListener("keydown", event => {
+      if (event.key === "Enter") { event.preventDefault(); save(); }
+      if (event.key === "Escape" && !busy) { event.preventDefault(); finish(); this.queueMessage(""); }
     });
-    dialog.showModal(); input.focus(); input.select();
+    input.addEventListener("input", () => input.removeAttribute("aria-invalid"));
+    input.focus(); input.select();
   }
 
   async saveBackup() {
@@ -1362,9 +1350,10 @@ export class FleetPanel {
     const menu = element("details", null, { className: "fleet-batch-menu" });
     const toggle = element("summary", "⋯");
     toggle.setAttribute("aria-label", `Batch actions for ${batch.name}`);
-    const rename = this.button("Rename batch", () => {
+    const rename = this.button("Edit batch", async () => {
       menu.open = false;
-      this.renameBatch(batch, toggle);
+      try { await this.actions.editBatchDetails(batch.id); }
+      catch (error) { this.queueMessage(error.message, true); }
     });
     const edit = this.button("Edit workflow", async () => {
       menu.open = false;
@@ -1375,7 +1364,7 @@ export class FleetPanel {
     menu.addEventListener("keydown", event => { if (event.key === "Escape") { menu.open = false; toggle.focus(); } });
     const discard = this.button("Discard changes and resume", async () => {
       menu.open = false;
-      if (!await this.confirmAction("Discard batch changes?", "The batch will keep its previous workflow and queue scheduling will resume.", "Discard changes")) return;
+      if (!await this.confirmAction("Discard batch changes?", "The batch will keep its saved name, size and workflow, and queue scheduling will resume.", "Discard changes")) return;
       try { await this.actions.discardBatchEdit(batch.id); }
       catch (error) { this.queueMessage(error.message, true); }
     });
@@ -1386,7 +1375,10 @@ export class FleetPanel {
     heading.append(name, menu);
     copy.append(heading, time, count, progress, footer);
     root.append(handle, copy);
-    return { batch, root, handle, name, time, count, progress, status, cancel, toggle, rename, edit, discard };
+    const row = { batch, root, handle, name, time, count, progress, status, cancel, toggle, rename, edit, discard };
+    name.title = "Double-click to rename";
+    name.addEventListener("dblclick", () => this.renameInline(row));
+    return row;
   }
 
   renderQueue() {
@@ -1415,12 +1407,15 @@ export class FleetPanel {
       if (!row) { row = this.createBatchRow(batch); this.queueRows.set(batch.id, row); }
       Object.assign(row.batch, batch);
       if (this.queueList.children[index] !== row.root) this.queueList.insertBefore(row.root, this.queueList.children[index] ?? null);
-      row.name.textContent = batch.name;
+      if (!row.renaming) row.name.textContent = batch.name;
       row.toggle.setAttribute("aria-label", `Batch actions for ${batch.name}`);
-      row.rename.disabled = !this.state.ready || this.cancellingQueue || this.cancellingBatches.has(batch.id);
+      const held = this.state.edit?.batch_id === batch.id;
+      const detailsHeld = held && this.state.edit.kind === "details";
+      row.rename.textContent = detailsHeld ? "Resume editing" : "Edit batch";
+      row.rename.disabled = !this.state.ready || Boolean(this.state.edit && !detailsHeld) || this.cancellingQueue || this.cancellingBatches.has(batch.id);
       row.discard.hidden = this.state.edit?.batch_id !== batch.id;
-      row.edit.textContent = this.state.edit?.batch_id === batch.id ? "Resume editing" : "Edit workflow";
-      row.edit.disabled = !this.state.ready || Boolean(this.state.edit && this.state.edit.batch_id !== batch.id);
+      row.edit.textContent = held && !detailsHeld ? "Resume editing" : "Edit workflow";
+      row.edit.disabled = !this.state.ready || Boolean(this.state.edit && (!held || detailsHeld));
       row.handle.setAttribute("aria-label", `Reorder ${batch.name}`);
       row.handle.disabled = busy || !this.state.ready || batches.length < 2;
       row.cancel.disabled = batchBusy(batch.id);

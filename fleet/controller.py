@@ -62,7 +62,24 @@ class Controller:
             previous = await self.store.call("prepare_edit", body)
             return await self._admit_prepared(body, previous)
 
-    async def _admit_prepared(self, body, previous=None):
+    async def save_details(self, body):
+        # Name-only edits and shrinking require no preparation or available workers.
+        if body.get("jobs"):
+            body = prepared_batch(body)
+        async with self.admission_lock:
+            prior = await self.store.call("edit_receipt", body)
+            if prior:
+                return prior
+            previous = await self.store.call("prepare_details", body)
+            if not body.get("jobs"):
+                result = await self.store.call("commit_details", body, [], [])
+                await self.cleanup_inputs()
+                return result
+            return await self._admit_prepared(
+                body, [previous[-1]] * len(body["jobs"]), "commit_details"
+            )
+
+    async def _admit_prepared(self, body, previous=None, commit=None):
         if self.fatal_error:
             raise Conflict("Fleet storage is unavailable; dispatch and admission are stopped")
         workers = [w for w in await self.store.call("workers") if w["enabled"]]
@@ -108,7 +125,7 @@ class Controller:
                     await asyncio.gather(snapshot, return_exceptions=True)
                     raise
             answer = await self.store.call(
-                "admit" if previous is None else "commit_edit", body, assets, eligible
+                commit or ("admit" if previous is None else "commit_edit"), body, assets, eligible
             )
             return {**answer, "excluded_workers": errors}
         finally:

@@ -1634,3 +1634,93 @@ def test_http_and_websocket_redirects_never_reach_the_target():
             await target_runner.cleanup()
 
     asyncio.run(scenario())
+
+
+def test_resize_preserves_inputs_and_failed_growth_keeps_jobs_name_and_hold(tmp_path):
+    from test_editing import credentials, resizable_batch
+
+    async def scenario():
+        roots = {name: tmp_path / name for name in ("input", "output", "temp")}
+        for path in roots.values():
+            path.mkdir()
+        original = b"original input bytes"
+        (roots["input"] / "one.png").write_bytes(original)
+        artifacts = Artifacts(tmp_path / "state", roots)
+        store = Store(tmp_path / "state")
+        await store.open()
+
+        class Compatible(Remote):
+            available = True
+
+            async def compatible(self, *args):
+                if not self.available:
+                    raise OSError("Worker offline")
+                return []
+
+        remote = Compatible(None)
+        control = Controller(store, remote, artifacts, lambda event: None)
+        try:
+            await store.call("configure", [{"id": "one", "url": "http://127.0.0.1:8188"}])
+            value = resizable_batch(2)
+            graph = {"1": {"class_type": "LoadImage", "inputs": {"image": "one.png"}}}
+            for job in value["jobs"]:
+                job["output"] = graph
+            await control.admit(value)
+            before = await store.call("jobs")
+            # A resize retains unchanged input bytes even after the original changes.
+            (roots["input"] / "one.png").write_bytes(b"changed on disk")
+            edit = await store.call("begin_edit", value["batch_id"], str(uuid.uuid4()), "details")
+            details = {"name": "Updated name", "total": 4}
+            draft = await store.call(
+                "save_draft", {**credentials(edit), "version": 0, "source": details}
+            )
+            request = {
+                **credentials(edit),
+                "batch_id": value["batch_id"],
+                "operation_id": str(uuid.uuid4()),
+                "version": draft["version"],
+                "source": details,
+                "jobs": value["jobs"],
+                "continuation": value["continuation"],
+            }
+            remote.available = False
+            with pytest.raises(ValueError, match="No compatible worker"):
+                await control.save_details(request)
+            assert await store.call("jobs") == before
+            state = await store.call("state")
+            assert state["edit"]["id"] == edit["id"]
+            assert state["batch_counts"][value["batch_id"]]["total"] == 2
+            assert value["batch_id"] not in state["batch_names"]
+            remote.available = True
+            answer = await control.save_details(request)
+            assert answer["added"] == 2
+            assert (await control.save_details(request))["replayed"]
+            jobs = await store.call("jobs")
+            assert len(jobs) == 4
+            assert jobs[:2] == before
+            assert all(job["assets"] == before[0]["assets"] for job in jobs)
+            assert (artifacts.blobs / jobs[-1]["assets"][0]["sha256"]).read_bytes() == original
+            # Shrinking needs no reachable worker and updates the total rather than cancellations.
+            edit = await store.call("begin_edit", value["batch_id"], str(uuid.uuid4()), "details")
+            details = {"name": "Empty", "total": 0}
+            version = await store.call(
+                "save_draft", {**credentials(edit), "version": 0, "source": details}
+            )
+            remote.available = False
+            shrunk = await control.save_details(
+                {
+                    **credentials(edit),
+                    "batch_id": value["batch_id"],
+                    "operation_id": str(uuid.uuid4()),
+                    "version": version["version"],
+                    "source": details,
+                    "jobs": [],
+                }
+            )
+            assert shrunk["removed"] == 4
+            assert await store.call("jobs") == []
+            assert list(artifacts.blobs.iterdir()) == []
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())

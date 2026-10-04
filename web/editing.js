@@ -1,9 +1,10 @@
-import { createBatchId, captureSource, prepareSnapshots } from "./preparation.js";
+import { createBatchId, captureSource, prepareSnapshots, captureContinuation, restoreContinuation } from "./preparation.js";
+import { BatchDetailsDialog } from "./details.js";
 
 // The controller owns the draft and hold; this object owns only the open editor session.
 export class BatchEditor {
-  constructor(app, control, post, refresh, message, isPreparing) {
-    Object.assign(this, { app, control, post, refresh, message, isPreparing });
+  constructor(app, control, post, refresh, message, isPreparing, controls, root) {
+    Object.assign(this, { app, control, post, refresh, message, isPreparing, controls, root });
     this.owner = sessionStorage.getItem("fleet-editor-owner") || createBatchId();
     sessionStorage.setItem("fleet-editor-owner", this.owner);
     this.originalLoad = app.loadGraphData;
@@ -43,8 +44,8 @@ export class BatchEditor {
     this.onPageHide = () => {
       if (!this.session) return;
       // The durable hold survives; release only the browser's short writer lease.
-      const draft = this.active && !this.busy && !this.pending
-        ? { source: captureSource(this.app), version: this.session.version } : {};
+      const draft = (this.active || this.details?.valid) && !this.busy && !this.pending
+        ? { source: this.draft(), version: this.session.version } : {};
       this.post("/fleet/edit/release", { ...this.credentials(), ...draft }, { keepalive: true }).catch(() => {});
     };
     window.addEventListener("pagehide", this.onPageHide);
@@ -59,11 +60,12 @@ export class BatchEditor {
 
   get marker() { return this.app.rootGraph.extra?.fleet_edit_id; }
   get active() { return Boolean(this.session && this.marker === this.session.id); }
+  draft() { return this.details ? this.details.value : captureSource(this.app); }
   credentials() { return { edit_id: this.session.id, token: this.session.token }; }
 
   fail(error) {
     this.error = error.message;
-    if (error.status === 409) { this.session = null; this.pending = null; }
+    if (error.status === 409) { this.session = null; this.pending = null; this.details?.close(); this.details = null; }
     this.message(error.message, true);
     this.render();
   }
@@ -91,6 +93,7 @@ export class BatchEditor {
   }
 
   render() {
+    this.details?.render({ busy: this.busy, pending: Boolean(this.pending), error: this.error, progress: this.progress });
     this.guardRunButtons();
     this.bar.hidden = !this.marker;
     const canvas = this.app.canvas.canvas;
@@ -108,18 +111,24 @@ export class BatchEditor {
         "Resume this batch edit from Fleet’s queue to continue.");
   }
 
-  async open(batchId) {
+  async open(batchId, kind = "workflow") {
     if (this.busy || this.opening || this.closing || this.isPreparing()) throw new Error("Wait for the current preparation to finish");
     this.opening = true;
     try {
       await this.persist();
-      const session = await this.post("/fleet/edit/begin", { batch_id: batchId, owner: this.owner });
+      const session = await this.post("/fleet/edit/begin", { batch_id: batchId, owner: this.owner, kind });
       if (!this.marker) this.returnWorkflow = this.app.extensionManager.workflow.activeWorkflow;
       this.session = session;
       this.pending = null;
       this.error = null;
       this.draftStatus = "Draft saved";
-      await this.loadDraft(session.draft);
+      if (session.kind === "details") {
+        this.details?.close();
+        this.lastSaved = JSON.stringify(session.draft);
+        this.details = new BatchDetailsDialog(this.root, session,
+          () => this.saveDetails().catch(error => this.fail(error)),
+          () => this.discard().catch(error => this.fail(error)));
+      } else await this.loadDraft(session.draft);
       await this.refresh();
     } finally { this.opening = false; }
   }
@@ -139,8 +148,8 @@ export class BatchEditor {
 
   persist(force = false) {
     const next = this.serial.then(async () => {
-      if (!this.active || (this.busy && !force) || this.pending) return;
-      const source = captureSource(this.app);
+      if ((!this.active && !this.details?.valid) || (this.busy && !force) || this.pending) return;
+      const source = this.draft();
       const signature = JSON.stringify(source);
       if (signature === this.lastSaved) return;
       const session = this.session;
@@ -190,7 +199,7 @@ export class BatchEditor {
           if (name) job.workflow.extra = { ...job.workflow.extra, fleet: { ...job.workflow.extra?.fleet, workflow_name: name } };
         }
         this.pending = { ...this.credentials(), operation_id: createBatchId(), batch_id: session.batch_id,
-          version: session.version, source, jobs };
+          version: session.version, source, jobs, continuation: captureContinuation(this.app, this.controls) };
       }
       await this.post("/fleet/edit/save", this.pending);
       saved = true;
@@ -203,6 +212,45 @@ export class BatchEditor {
         if (error.status >= 400 && error.status < 500) this.pending = null;
         await this.loadDraft(source);
       }
+      throw error;
+    } finally { this.busy = false; this.render(); }
+  }
+
+  async saveDetails() {
+    if (!this.details?.valid || this.busy || this.isPreparing()) return;
+    this.busy = true; this.error = null; this.render();
+    try {
+      await this.persist(true);
+      if (!this.pending) {
+        const session = this.session;
+        const source = this.details.value;
+        const count = Math.max(0, source.total - session.total);
+        let jobs = [], continuation;
+        if (count) {
+          this.returnWorkflow = this.app.extensionManager.workflow.activeWorkflow;
+          try {
+            await this.loadDraft(session.continuation.workflow);
+            restoreContinuation(this.app, this.control, this.controls, session.continuation);
+            jobs = await prepareSnapshots(this.app, this.control, count, done => {
+              this.progress = `Preparing ${done}/${count} additional jobs…`; this.render();
+            });
+            continuation = captureContinuation(this.app, this.controls);
+            if (continuation.error) throw new Error(continuation.error);
+            for (const job of jobs) {
+              delete job.workflow.extra?.fleet_edit_id;
+              job.workflow.extra = { ...job.workflow.extra, fleet: { ...job.workflow.extra?.fleet, workflow_name: source.name } };
+            }
+          } finally { await this.closeDraft(); this.progress = null; }
+        }
+        this.pending = { ...this.credentials(), operation_id: createBatchId(), batch_id: session.batch_id,
+          version: session.version, source, jobs, ...(continuation ? { continuation } : {}) };
+      }
+      await this.post("/fleet/edit/details", this.pending);
+      await this.finish();
+      this.message("Batch changes saved.");
+      await this.refresh();
+    } catch (error) {
+      if (error.status >= 400 && error.status < 500) this.pending = null;
       throw error;
     } finally { this.busy = false; this.render(); }
   }
@@ -228,11 +276,18 @@ export class BatchEditor {
   }
 
   async finish() {
+    this.details?.close(); this.details = null;
+    await this.closeDraft();
+    this.session = null; this.pending = null; this.error = null;
+    this.render();
+  }
+
+  async closeDraft() {
     if (this.closing) return this.closing;
     const workflows = this.app.extensionManager.workflow;
     const editId = this.session?.id ?? this.marker;
+    if (!editId) return;
     const draft = workflows.openWorkflows.find(workflow => workflow.activeState?.extra?.fleet_edit_id === editId);
-    this.session = null; this.pending = null; this.error = null;
     this.closing = (async () => {
       if (!draft) return;
       // The native store removes a tab without prompting, but does not switch its canvas.
@@ -256,6 +311,7 @@ export class BatchEditor {
     for (const [button, original] of this.runButtons) Object.assign(button, original);
     window.removeEventListener("pagehide", this.onPageHide);
     this.onPageHide();
+    this.details?.close();
     if (this.app.loadGraphData === this.load) this.app.loadGraphData = this.originalLoad;
     window.removeEventListener("keydown", this.guardKeys, true);
     this.shield.remove();

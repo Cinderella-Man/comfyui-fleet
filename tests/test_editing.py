@@ -228,3 +228,168 @@ def test_failed_queue_reset_rolls_back_version_and_waiting_jobs(tmp_path, monkey
     with connect(root / "fleet.sqlite") as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 2
         assert db.execute("SELECT state FROM jobs").fetchone()[0] == "waiting"
+
+
+def resizable_batch(count):
+    value = batch(count)
+    value["continuation"] = {
+        "version": 1,
+        "workflow": {"nodes": [], "extra": {"next_seed": count}},
+        "mode": "after",
+        "controls": {},
+    }
+    return value
+
+
+def details_request(store, batch_id, total, name="Resized"):
+    edit = store.begin_edit(batch_id, str(uuid.uuid4()), "details")
+    details = {"name": name, "total": total}
+    saved = store.save_draft({**credentials(edit), "version": edit["version"], "source": details})
+    added = max(0, total - edit["total"])
+    return {
+        **credentials(edit),
+        "operation_id": str(uuid.uuid4()),
+        "batch_id": batch_id,
+        "version": saved["version"],
+        "source": details,
+        "jobs": batch(added)["jobs"] if added else [],
+        **({"continuation": resizable_batch(total)["continuation"]} if added else {}),
+    }
+
+
+def test_resize_preserves_prepared_jobs_position_receipt_and_survives_restart(ledger):
+    value, later = resizable_batch(100), batch(2)
+    receipt = admit(ledger, value)
+    admit(ledger, later)
+    assigned = ledger.claim("a")
+    ledger.finish(assigned["id"], history())
+    ledger.collected(assigned["id"], {})
+    ledger.prune()
+    ledger.claim("a")
+    original = [job for job in ledger.jobs() if job["batch_id"] == value["batch_id"]]
+    request = details_request(ledger, value["batch_id"], 500)
+    assert ledger.claim("b") is None
+    answer = ledger.commit_details(request, [[]] * 400, [["a", "b"]] * 400)
+    assert answer["added"] == 400
+    assert ledger.commit_details(request, [], [])["replayed"]
+    assert admit(ledger, value)["job_ids"] == receipt["job_ids"]
+    for job in original:
+        assert ledger.job(job["id"]) == job
+    queued = ledger.waiting_jobs()
+    assert [job["batch_id"] for job in queued] == [value["batch_id"]] * 498 + [
+        later["batch_id"]
+    ] * 2
+    assert ledger.state()["batch_counts"][value["batch_id"]]["total"] == 500
+    root = ledger.root
+    ledger.close()
+    reopened = Ledger(root)
+    try:
+        edit = reopened.begin_edit(value["batch_id"], str(uuid.uuid4()), "details")
+        assert edit["minimum"] == 2
+        assert edit["total"] == 500
+        assert edit["draft"]["name"] == "Resized"
+        assert edit["continuation"]["workflow"]["extra"]["next_seed"] == 500
+        assert reopened.db.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        reopened.close()
+
+
+def test_shrink_removes_only_waiting_tail_and_regrowth_keeps_forward_checkpoint(ledger):
+    value = resizable_batch(5)
+    ids = admit(ledger, value)["job_ids"]
+    first = ledger.claim("a")
+    ledger.finish(first["id"], history())
+    ledger.collected(first["id"], {})
+    ledger.prune()
+    active = ledger.claim("a")
+    request = details_request(ledger, value["batch_id"], 3)
+    result = ledger.commit_details(request, [], [])
+    assert result["removed"] == 2
+    assert ledger.job(ids[2])["state"] == "waiting"
+    assert ledger.job(ids[3]) is None and ledger.job(ids[4]) is None
+    assert ledger.job(active["id"]) == active
+    counts = ledger.state()["batch_counts"][value["batch_id"]]
+    assert counts["total"] == 3 and counts["completed"] == 1 and counts["cancelled"] == 0
+    edit = ledger.begin_edit(value["batch_id"], str(uuid.uuid4()), "details")
+    assert edit["continuation"]["workflow"]["extra"]["next_seed"] == 5
+    ledger.discard_edit(credentials(edit))
+    request = details_request(ledger, value["batch_id"], 5)
+    ledger.commit_details(request, [[], []], [["a"], ["a"]])
+    assert [job["ordinal"] for job in ledger.waiting_jobs()] == [2, 5, 6]
+    request = details_request(ledger, value["batch_id"], 2)
+    ledger.commit_details(request, [], [])
+    assert ledger.waiting_jobs() == []
+    assert ledger.job(active["id"]) == active
+    assert ledger.state()["batch_counts"][value["batch_id"]]["cancelled"] == 0
+    with pytest.raises(Conflict, match="no longer has queued"):
+        ledger.begin_edit(value["batch_id"], str(uuid.uuid4()), "details")
+
+
+def test_resize_rejects_below_floor_oversized_and_legacy_growth_and_preserves_hold(ledger):
+    value = batch(3)
+    admit(ledger, value)
+    ledger.claim("a")
+    request = details_request(ledger, value["batch_id"], 0)
+    with pytest.raises(ValueError, match="below 1"):
+        ledger.commit_details(request, [], [])
+    assert ledger.edit_state()
+    assert ledger.state()["batch_counts"][value["batch_id"]]["total"] == 3
+    assert value["batch_id"] not in ledger.state()["batch_names"]
+    ledger.discard_edit(request)
+    request = details_request(ledger, value["batch_id"], 4)
+    with pytest.raises(Conflict, match="cannot grow safely"):
+        ledger.commit_details(request, [[]], [["a"]])
+    for total in (1001, -1, 2.5, True, None):
+        with pytest.raises(ValueError, match="whole number"):
+            ledger.save_draft({**request, "source": {"name": "Invalid", "total": total}})
+    assert ledger.edit_state()
+    ledger.discard_edit(request)
+    request = details_request(ledger, value["batch_id"], 1)
+    ledger.commit_details(request, [], [])
+    assert ledger.state()["batch_counts"][value["batch_id"]]["total"] == 1
+
+
+def test_details_draft_recovery_and_single_writer_share_workflow_hold(ledger):
+    value, later = resizable_batch(3), batch(1)
+    admit(ledger, value)
+    later_id = admit(ledger, later)["job_ids"][0]
+    request = details_request(ledger, value["batch_id"], 5)
+    with pytest.raises(Conflict, match="another browser"):
+        ledger.begin_edit(value["batch_id"], str(uuid.uuid4()))
+    with pytest.raises(Conflict, match="current batch edit"):
+        ledger.begin_edit(later["batch_id"], str(uuid.uuid4()))
+    with pytest.raises(Conflict, match="locked"):
+        ledger.action(later_id, "front")
+    ledger.release_edit_owner(request)
+    edit = ledger.begin_edit(value["batch_id"], str(uuid.uuid4()))
+    assert edit["kind"] == "details" and edit["draft"] == request["source"]
+    with pytest.raises(Conflict, match="no longer current"):
+        ledger.commit_details(request, [[], []], [["a"], ["a"]])
+    ledger.discard_edit(credentials(edit))
+    assert ledger.state()["batch_counts"][value["batch_id"]]["total"] == 3
+
+
+def test_version_three_upgrade_keeps_queue_and_existing_workflow_draft(tmp_path):
+    root = tmp_path / "state"
+    store = Ledger(root)
+    store.configure([{"id": "a", "url": "http://127.0.0.1:8188"}])
+    value = batch(3)
+    ids = store.admit(value, [[]] * 3, [["a"]] * 3)["job_ids"]
+    edit = store.begin_edit(value["batch_id"], str(uuid.uuid4()))
+    store.close()
+    with sqlite3.connect(root / "fleet.sqlite") as db:
+        db.execute("ALTER TABLE batch_progress DROP COLUMN total")
+        db.execute("ALTER TABLE batch_edit DROP COLUMN kind")
+        db.execute("DROP TABLE batch_preparation")
+        db.execute("PRAGMA user_version=3")
+    store = Ledger(root)
+    try:
+        assert [job["id"] for job in store.waiting_jobs()] == ids
+        assert store.edit_state()["id"] == edit["id"]
+        assert store.edit_state()["kind"] == "workflow"
+        assert store.state()["batch_counts"][value["batch_id"]]["total"] == 3
+        store.discard_edit(credentials(edit))
+        resized = store.begin_edit(value["batch_id"], str(uuid.uuid4()), "details")
+        assert resized["continuation"] is None
+    finally:
+        store.close()

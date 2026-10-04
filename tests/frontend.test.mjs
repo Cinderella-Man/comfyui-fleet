@@ -271,3 +271,20 @@ test("authored source is captured before queue callbacks resolve prompts and adv
   assert(jobs.every(job=>job.output[1].inputs.prompt==="a"));
   assert.equal(source.extra.fleet.workflow_name,"Production");
 });
+
+test('continuation refuses custom private callbacks and changed native controls without running them', () => {
+  let calls=0;
+  const controls={beforeQueued:'native before',afterQueued:'native after',promoted:'native promoted'};
+  const app={rootGraph:{nodes:[{widgets:[{beforeQueued(){calls++}}]}],serialize(){return {nodes:[]}}}};
+  const saved=preparation.captureContinuation(app,controls);
+  assert.match(saved.error,/custom generation controls/);
+  assert.equal(calls,0);
+  assert.throws(()=>preparation.restoreContinuation(app,()=>calls++,controls,saved),/custom/);
+  const clean={rootGraph:{nodes:[],serialize(){return {nodes:[],extra:{prompt:'{a|b}'}}}}};
+  const checkpoint=preparation.captureContinuation(clean,controls);
+  assert.equal(checkpoint.workflow.extra.prompt,'{a|b}');
+  assert.throws(()=>preparation.restoreContinuation(clean,()=>calls++,{...controls,beforeQueued:'changed'},checkpoint),/controls changed/);
+  clean.ui={settings:{getSettingValue:()=> 'before'}};
+  assert.throws(()=>preparation.restoreContinuation(clean,()=>calls++,controls,checkpoint),/controls changed/);
+  assert.equal(calls,0);
+});

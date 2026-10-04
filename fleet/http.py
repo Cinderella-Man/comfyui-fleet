@@ -61,6 +61,7 @@ class Routes:
             ("POST", "/edit/release", self.release_edit_owner),
             ("POST", "/edit/discard", self.discard_edit),
             ("POST", "/edit/save", self.save_edit),
+            ("POST", "/edit/details", self.save_details),
             ("GET", "/batches/{batch_id}", self.batch),
             ("POST", "/batches/{batch_id}/rename", self.rename_batch),
             ("POST", "/batches/{batch_id}/cancel", self.cancel_batch),
@@ -176,7 +177,9 @@ class Routes:
     async def begin_edit(self, request):
         data = await body(request)
         return web.json_response(
-            await self.ready().store.call("begin_edit", data["batch_id"], data["owner"])
+            await self.ready().store.call(
+                "begin_edit", data["batch_id"], data["owner"], data.get("kind", "workflow")
+            )
         )
 
     async def save_draft(self, request):
@@ -195,6 +198,9 @@ class Routes:
 
     async def save_edit(self, request):
         return web.json_response(await self.ready().save_edit(await body(request)))
+
+    async def save_details(self, request):
+        return web.json_response(await self.ready().save_details(await body(request)))
 
     async def batch(self, request):
         result = await self.ready().store.call("batch", request.match_info["batch_id"])

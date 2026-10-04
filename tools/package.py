@@ -26,6 +26,7 @@ files = [
         "fleet/worker.py",
         "web/fleet.js",
         "web/editing.js",
+        "web/details.js",
         "web/panel.js",
         "web/preparation.js",
         "web/progress.js",

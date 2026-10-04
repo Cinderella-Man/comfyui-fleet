@@ -213,7 +213,14 @@ async def main(root, node_count):
 
         async def source(request):
             name = request.match_info["name"]
-            if name not in ("fleet.js", "panel.js", "preparation.js", "progress.js", "editing.js"):
+            if name not in (
+                "fleet.js",
+                "panel.js",
+                "preparation.js",
+                "progress.js",
+                "editing.js",
+                "details.js",
+            ):
                 raise web.HTTPNotFound()
             return web.FileResponse(Path(__file__).resolve().parents[1] / "web" / name)
 
@@ -222,6 +229,7 @@ async def main(root, node_count):
                 "app.js": APP,
                 "api.js": API,
                 "promotedWidgetControl.js": "export function applyPromotedWidgetControl(){}",
+                "widgets.js": "export function addValueControlWidgets(){return [{beforeQueued(){},afterQueued(){}}]}",
             }
             return web.Response(
                 text=modules[request.match_info["name"]], content_type="text/javascript"

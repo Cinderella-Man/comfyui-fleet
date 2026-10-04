@@ -1528,12 +1528,12 @@ for (const action of ['Save to batch','Discard changes']) test(`${action} closes
   assert.equal(await page.locator('.fleet-edit-bar:visible').count(),0);
 });
 
-async function openBatchRename(page, id) {
+async function openBatchDetails(page, id) {
   await page.evaluate(()=>window.comfyFleet.refresh());
   const row=page.locator(`[data-batch-id="${id}"]`);
   await row.locator('summary').click();
-  await row.getByRole('button',{name:'Rename batch',exact:true}).click();
-  const dialog=page.getByRole('dialog',{name:'Rename batch',exact:true});
+  await row.getByRole('button',{name:'Edit batch',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'Edit batch',exact:true});
   await dialog.waitFor();
   return dialog;
 }
@@ -1544,8 +1544,8 @@ test('renaming a queued batch persists, updates active cards, and preserves its 
   const second=await submit('Other batch',2);
   await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
   const before=await state();
-  const dialog=await openBatchRename(page,first.batch_id);
-  const input=dialog.getByRole('textbox',{name:'Batch name',exact:true});
+  const dialog=await openBatchDetails(page,first.batch_id);
+  const input=dialog.getByRole('textbox',{name:'Name',exact:true});
   assert.equal(await input.inputValue(),'Original');
   assert.equal(await input.evaluate(el=>el===document.activeElement),true);
   const renamed='Finals — <v2>';
@@ -1570,36 +1570,41 @@ test('renaming a queued batch persists, updates active cards, and preserves its 
   await post('/fixture',{restart:true});
   await page.reload();
   await queue.getByText(renamed,{exact:true}).waitFor();
-  const reopened=await openBatchRename(page,first.batch_id);
-  assert.equal(await reopened.getByRole('textbox',{name:'Batch name',exact:true}).inputValue(),renamed);
+  const reopened=await openBatchDetails(page,first.batch_id);
+  assert.equal(await reopened.getByRole('textbox',{name:'Name',exact:true}).inputValue(),renamed);
   await reopened.getByRole('button',{name:'Cancel',exact:true}).click();
 });
 
-test('batch rename supports cancellation, validates empty names, and retains input after a failed save',{timeout:30000},async t=>{
+test('batch details supports cancellation, validates names, and retries the identical save',{timeout:30000},async t=>{
   const {page,submit,until,state}=await setup(t);
   const accepted=await submit('Original',5);
   await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
-  let dialog=await openBatchRename(page,accepted.batch_id);
-  await dialog.getByRole('textbox',{name:'Batch name',exact:true}).fill('   ');
-  assert.equal(await dialog.getByRole('button',{name:'Save',exact:true}).isDisabled(),true);
+  let dialog=await openBatchDetails(page,accepted.batch_id);
+  assert.equal((await state()).edit.kind,'details');
+  await dialog.getByRole('textbox',{name:'Name',exact:true}).fill('   ');
+  assert.equal(await dialog.getByRole('button',{name:'Save changes',exact:true}).isDisabled(),true);
   await dialog.press('Escape');
+  await dialog.waitFor({state:'hidden'});
   assert.equal((await state()).batch_names[accepted.batch_id],'Original');
-  dialog=await openBatchRename(page,accepted.batch_id);
-  const input=dialog.getByRole('textbox',{name:'Batch name',exact:true});
+  assert.equal((await state()).edit,null);
+  dialog=await openBatchDetails(page,accepted.batch_id);
+  const input=dialog.getByRole('textbox',{name:'Name',exact:true});
   await input.fill('Retry this name');
-  let release,received,requests=0;
+  let release,received;
+  const requests=[];
   const held=new Promise(resolve=>{release=resolve});
   const seen=new Promise(resolve=>{received=resolve});
   t.after(()=>release());
-  await page.route('**/fleet/batches/*/rename',async route=>{
-    if(++requests===1)return route.abort('failed');
+  await page.route('**/fleet/edit/details',async route=>{
+    requests.push(route.request().postDataJSON());
+    if(requests.length===1)return route.abort('failed');
     received();await held;await route.continue();
   });
-  await dialog.getByRole('button',{name:'Save',exact:true}).click();
-  await dialog.getByRole('alert').getByText(/^Could not rename batch\./).waitFor();
+  await dialog.getByRole('button',{name:'Save changes',exact:true}).click();
+  await dialog.getByRole('alert').waitFor();
   assert.equal(await input.inputValue(),'Retry this name');
   assert.equal((await state()).batch_names[accepted.batch_id],'Original');
-  await dialog.getByRole('button',{name:'Save',exact:true}).click();
+  await dialog.getByRole('button',{name:'Retry save',exact:true}).click();
   await seen;
   assert.equal(await dialog.getByRole('button',{name:'Saving…',exact:true}).isDisabled(),true);
   assert.equal(await dialog.getByRole('button',{name:'Cancel',exact:true}).isDisabled(),true);
@@ -1608,7 +1613,7 @@ test('batch rename supports cancellation, validates empty names, and retains inp
   release();
   await dialog.waitFor({state:'hidden'});
   assert.equal((await state()).batch_names[accepted.batch_id],'Retry this name');
-  assert.equal(requests,2);
+  assert.deepEqual(requests[0],requests[1]);
 });
 
 test('batch rename rejects stale queue entries and malformed names through the HTTP API',{timeout:30000},async t=>{
@@ -1624,4 +1629,136 @@ test('batch rename rejects stale queue entries and malformed names through the H
   await until(s=>!s.jobs.some(j=>j.state==='waiting'));
   assert.equal((await page.request.post(url,{data:{name:'Too late'}})).status(),409);
   assert.equal((await state()).batch_names[accepted.batch_id],'Original');
+});
+
+test('Edit batch grows 100 to 500, preserves queued jobs, and shrinks to the started-job floor',{timeout:45000},async t=>{
+  const {page,submit,until,state}=await setup(t);
+  const accepted=await submit('Large batch',100);
+  await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
+  const later=await submit('Later',2);
+  const before=await state();
+  const original=await page.evaluate(async()=>{
+    const {app}=await import('/scripts/app.js');
+    app.rootGraph.extra.prompt='unsaved work';
+    return {tabs:app.extensionManager.workflow.openWorkflows.length,filename:app.extensionManager.workflow.activeWorkflow.filename};
+  });
+  let dialog=await openBatchDetails(page,accepted.batch_id);
+  assert.deepEqual(await dialog.locator('label').allTextContents(),['Name','Total jobs']);
+  const total=dialog.getByRole('spinbutton',{name:'Total jobs',exact:true});
+  assert.equal(await total.inputValue(),'100');
+  await total.fill('500');
+  await dialog.getByText('400 queued jobs will be added.',{exact:true}).waitFor();
+  if(process.env.FLEET_E2E_SCREENSHOTS){
+    await mkdir(process.env.FLEET_E2E_SCREENSHOTS,{recursive:true});
+    await page.screenshot({path:join(process.env.FLEET_E2E_SCREENSHOTS,'edit-batch.png')});
+  }
+  const save=page.waitForResponse(r=>r.url().endsWith('/fleet/edit/details'));
+  await dialog.getByRole('button',{name:'Save changes',exact:true}).click();
+  const response=await save;
+  assert.equal(response.ok(),true,await response.text());
+  await dialog.waitFor({state:'hidden'});
+  let after=await state();
+  assert.equal(after.batch_counts[accepted.batch_id].total,500);
+  assert.equal(after.edit,null);
+  assert.deepEqual(after.jobs.filter(j=>before.jobs.some(old=>old.id===j.id)),before.jobs);
+  assert.deepEqual(after.jobs.filter(j=>j.state==='waiting').map(j=>j.batch_id),[...Array(498).fill(accepted.batch_id),later.batch_id,later.batch_id]);
+  const restored=await page.evaluate(async()=>{
+    const {app}=await import('/scripts/app.js');
+    return {tabs:app.extensionManager.workflow.openWorkflows.length,filename:app.extensionManager.workflow.activeWorkflow.filename,prompt:app.rootGraph.extra.prompt};
+  });
+  assert.deepEqual(restored,{...original,prompt:'unsaved work'});
+  dialog=await openBatchDetails(page,accepted.batch_id);
+  await dialog.getByRole('spinbutton',{name:'Total jobs',exact:true}).fill('1');
+  assert.equal(await dialog.getByRole('button',{name:'Save changes',exact:true}).isDisabled(),true);
+  await dialog.getByRole('spinbutton',{name:'Total jobs',exact:true}).fill('2');
+  await dialog.getByRole('button',{name:'Save changes',exact:true}).click();
+  await dialog.waitFor({state:'hidden'});
+  after=await state();
+  assert.equal(after.batch_counts[accepted.batch_id].total,2);
+  assert.equal(after.batch_counts[accepted.batch_id].cancelled,0);
+  assert.deepEqual(after.jobs.filter(j=>j.batch_id===accepted.batch_id),before.jobs.filter(j=>j.occupied));
+  await page.locator(`.fleet-batch[data-batch-id="${accepted.batch_id}"]`).waitFor({state:'hidden'});
+});
+
+test('batch details draft survives browser loss and cancellation leaves name and total unchanged',{timeout:30000},async t=>{
+  const {page,submit,until,state}=await setup(t);
+  const accepted=await submit('Recover details',5);
+  await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
+  let dialog=await openBatchDetails(page,accepted.batch_id);
+  const autosaved=page.waitForResponse(r=>r.url().endsWith('/fleet/edit/draft')&&r.request().postDataJSON().source.total===200);
+  await dialog.getByRole('textbox',{name:'Name',exact:true}).fill('Draft name');
+  await dialog.getByRole('spinbutton',{name:'Total jobs',exact:true}).fill('200');
+  assert((await autosaved).ok());
+  await page.reload();
+  await page.getByRole('button',{name:'Manage nodes',exact:true}).waitFor();
+  assert.equal((await state()).edit.kind,'details');
+  const row=page.locator(`[data-batch-id="${accepted.batch_id}"]`);
+  await row.locator('summary').click();
+  await row.getByRole('button',{name:'Resume editing',exact:true}).click();
+  dialog=page.getByRole('dialog',{name:'Edit batch',exact:true});
+  assert.equal(await dialog.getByRole('textbox',{name:'Name',exact:true}).inputValue(),'Draft name');
+  assert.equal(await dialog.getByRole('spinbutton',{name:'Total jobs',exact:true}).inputValue(),'200');
+  await dialog.getByRole('button',{name:'Cancel',exact:true}).click();
+  await dialog.waitFor({state:'hidden'});
+  const after=await state();
+  assert.equal(after.edit,null);
+  assert.equal(after.batch_names[accepted.batch_id],'Recover details');
+  assert.equal(after.batch_counts[accepted.batch_id].total,5);
+});
+
+test('double-click rename saves on blur or Enter, rejects empty names, and Escape discards without a hold',{timeout:30000},async t=>{
+  const {page,submit,until,state}=await setup(t);
+  const accepted=await submit('Inline name',5);
+  await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
+  await page.evaluate(()=>window.comfyFleet.refresh());
+  const row=page.locator(`[data-batch-id="${accepted.batch_id}"]`);
+  const name=row.locator('.fleet-batch-heading > strong');
+  const input=row.getByRole('textbox',{name:'Batch name',exact:true});
+  await name.dblclick();await input.fill('On blur');
+  await page.evaluate(()=>window.comfyFleet.refresh());
+  assert.equal(await input.inputValue(),'On blur','Polling must not replace the inline field');
+  assert.equal((await state()).edit,null);
+  await row.locator('summary').click();
+  await input.waitFor({state:'hidden'});
+  assert.equal((await state()).batch_names[accepted.batch_id],'On blur');
+  await row.locator('summary').click();
+  await name.dblclick();await input.fill('On Enter');await input.press('Enter');
+  await input.waitFor({state:'hidden'});
+  assert.equal((await state()).batch_names[accepted.batch_id],'On Enter');
+  await name.dblclick();await input.fill('   ');await input.press('Enter');
+  assert.equal(await input.getAttribute('aria-invalid'),'true');
+  assert.equal((await state()).batch_names[accepted.batch_id],'On Enter');
+  await input.fill('Discard this');await input.press('Escape');
+  assert.equal((await state()).batch_names[accepted.batch_id],'On Enter');
+  assert.equal((await state()).edit,null);
+});
+
+test('retrying batch growth reuses prepared additions without advancing controls again',{timeout:30000},async t=>{
+  const {page,submit,until,state}=await setup(t);
+  const accepted=await submit('Retry growth',5);
+  await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
+  const dialog=await openBatchDetails(page,accepted.batch_id);
+  await dialog.getByRole('spinbutton',{name:'Total jobs',exact:true}).fill('8');
+  await page.evaluate(async()=>{
+    const {app}=await import('/scripts/app.js');
+    const original=app.graphToPrompt;
+    window.preparations=0;
+    app.graphToPrompt=async(...args)=>{window.preparations++;return original.apply(app,args)};
+  });
+  const requests=[];
+  await page.route('**/fleet/edit/details',async route=>{
+    requests.push(route.request().postData());
+    if(requests.length===1)await route.abort('failed');else await route.continue();
+  });
+  await dialog.getByRole('button',{name:'Save changes',exact:true}).click();
+  await dialog.getByRole('button',{name:'Retry save',exact:true}).waitFor();
+  assert.equal(await page.evaluate(()=>window.preparations),3);
+  assert.equal((await state()).batch_counts[accepted.batch_id].total,5);
+  assert.equal((await state()).edit.kind,'details');
+  await dialog.getByRole('button',{name:'Retry save',exact:true}).click();
+  await dialog.waitFor({state:'hidden'});
+  assert.equal(await page.evaluate(()=>window.preparations),3);
+  assert.deepEqual(requests[0],requests[1]);
+  assert.equal((await state()).batch_counts[accepted.batch_id].total,8);
+  assert.equal((await state()).edit,null);
 });

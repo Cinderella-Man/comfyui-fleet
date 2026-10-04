@@ -153,7 +153,7 @@ def test_upgrade_preserves_job_identities_and_backs_up_only_nodes(tmp_path):
     value, legacy, original = legacy_ledger(root)
     store = Ledger(root)
     try:
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 4
         assert store.db.execute("PRAGMA foreign_key_check").fetchall() == []
         upgraded = [dict(row) for row in store.db.execute("SELECT * FROM jobs ORDER BY ordinal")]
         assert upgraded[:3] == original[:3]

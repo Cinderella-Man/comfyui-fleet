@@ -1,6 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { prepareSnapshots, createBatchId, captureSource } from "./preparation.js";
+import { prepareSnapshots, createBatchId, captureSource, captureContinuation, nativeControls } from "./preparation.js";
 import { BatchEditor } from "./editing.js";
 import { FleetPanel } from "./panel.js";
 import { SelectedJob, executionEvents } from "./progress.js";
@@ -15,12 +15,17 @@ app.registerExtension({
     const state = { phase: "connecting", server: null, selected: null, waitingActions: 0, error: null };
     let capabilityError = null;
     let prepareControl;
+    let controls;
     try {
       const helper = await import("../../scripts/promotedWidgetControl.js");
       prepareControl = helper.applyPromotedWidgetControl;
       if (typeof prepareControl !== "function" || !app.extensionManager?.registerSidebarTab) {
         throw new Error("Required frontend extension interfaces are unavailable");
       }
+      try {
+        const widgets = await import("../../scripts/widgets.js");
+        controls = nativeControls(widgets.addValueControlWidgets, prepareControl);
+      } catch { /* Ordinary submission remains available; growth will explain the limitation. */ }
     } catch (error) { capabilityError = error.message; }
     let serial = Promise.resolve(), refreshTask = null, requestSequence = 0;
     let ws = null, reconnect = null, disposed = false;
@@ -59,6 +64,7 @@ app.registerExtension({
       select,
       retry: refresh,
       editBatch: id => editor.open(id),
+      editBatchDetails: id => editor.open(id, "details"),
       renameBatch: (id, name) => mutate(`/fleet/batches/${id}/rename`, { name }),
       discardBatchEdit: id => editor.discardBatch(id),
       cancelQueued: batch_id => mutate("/fleet/queue/cancel", batch_id == null ? {} : { batch_id }),
@@ -73,7 +79,7 @@ app.registerExtension({
       reenable: (id, worker_id) => mutate(`/fleet/batches/${id}/reenable`, { worker_id }),
     });
     const editor = new BatchEditor(app, prepareControl, post, refresh, message,
-      () => state.waitingActions > 0 || ["preparing", "submitting"].includes(state.phase));
+      () => state.waitingActions > 0 || ["preparing", "submitting"].includes(state.phase), controls, panel.root);
     const progress = new SelectedJob(dispatch);
     app.extensionManager.registerSidebarTab({ id: "fleet", title: "Fleet", icon: "pi pi-server",
       type: "custom", render: container => {
@@ -187,6 +193,7 @@ app.registerExtension({
         return false;
       }
       const body = { batch_id: createBatchId(), source, jobs, front: args[0] === -1 };
+      body.continuation = captureContinuation(app, controls);
       if (new TextEncoder().encode(JSON.stringify(body)).length > 32*1024*1024) {
         state.phase = "error"; message("Prepared batch exceeds 32 MiB; zero jobs accepted.", true); return false;
       }

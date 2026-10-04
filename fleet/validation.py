@@ -89,6 +89,32 @@ def source_workflow(value):
     return value
 
 
+def batch_details(value):
+    if not isinstance(value, dict):
+        raise ValueError("Expected a batch name and total jobs")
+    name = value.get("name")
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 200:
+        raise ValueError("Batch name must contain 1–200 characters")
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise ValueError("Batch name must be a single line without control characters")
+    total = value.get("total")
+    if type(total) is not int or not 0 <= total <= MAX_JOBS:
+        raise ValueError(f"Total jobs must be a whole number between 0 and {MAX_JOBS}")
+    return {"name": name.strip(), "total": total}
+
+
+def continuation(value):
+    if value is None:
+        return
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise ValueError("Unsupported preparation continuation")
+    if isinstance(value.get("error"), str):
+        return
+    source_workflow(value.get("workflow"))
+    if value.get("mode") not in ("before", "after") or not isinstance(value.get("controls"), dict):
+        raise ValueError("Invalid preparation controls")
+
+
 def prepared_batch(body):
     # Accept an older prepared request, but use job terminology internally.
     if "runs" in body:
@@ -114,6 +140,7 @@ def prepared_batch(body):
                 raise ValueError("Invalid execution node")
     if len(canonical(body).encode()) > MAX_BODY:
         raise ValueError("Prepared batch exceeds 32 MiB")
+    continuation(body.get("continuation"))
     return body
 
 

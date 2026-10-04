@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Resize batches without replaying prepared work
@@ -54,18 +54,35 @@ the workflow itself calls for repeated values.
 
 Reject reuse of the workflow-edit save behavior for resizing: it prepares
 waiting work again from the authored source and can repeat seeds already used
-by finished jobs. The proposed replacement preserves existing prepared jobs,
+by finished jobs. The replacement preserves existing prepared jobs,
 removes only the queued tail when shrinking, and prepares only additional jobs
 when growing. Additional jobs must continue generation controls instead of
-restarting them. Fleet does not currently retain the control state after the
-final job was prepared, so continuation requires further design.
+restarting them.
 
-The continuation proposal stores the next preparation state separately from
-the authored source, and commits added jobs and their advanced state together.
+Store the next preparation state separately from the authored source, and
+commit added jobs and their advanced state together.
 Stock controls that run before generation need their first-use behavior
 restored as well as their saved values; simply loading the last seed can repeat
 it. Retry must reuse an already prepared addition instead of adding it twice.
 
-Shrinking followed by growth, batches created before continuation state exists,
-and limits on nonserializable custom control state remain to be settled before
-implementation.
+Shrinking does not rewind preparation state. A later increase continues past
+the furthest prepared values, including those discarded by shrinking. This
+avoids replay and does not require a checkpoint for every job.
+
+Existing batches without a continuation checkpoint remain renameable and
+shrinkable. Reject growth with an explanation rather than guessing generation
+state from prepared jobs. The schema upgrade preserves their queued jobs and
+existing edit drafts.
+
+Support native generation controls, including promoted subgraph controls, by
+restoring serialized workflow values and priming native first-use state without
+advancing values. Retain the native control mode and implementation identity;
+reject continuation if they have changed. Custom before/after-queue callbacks
+with private state cannot be resumed generically. Such workflows can still be
+submitted and edited, but growth is unavailable. Keep authored prompt templates
+in the serialized continuation; never use a prepared job as the source.
+
+Keep admission receipts unchanged after resizing so a retry of the original
+submission cannot recreate removed jobs or alter its original response. Store
+the current total separately, and discard continuation data when the batch no
+longer has retained jobs.

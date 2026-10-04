@@ -23,6 +23,7 @@
 /web/*
 !/web/fleet.js
 !/web/editing.js
+!/web/details.js
 !/web/panel.js
 !/web/preparation.js
 !/web/progress.js
@@ -49,6 +50,7 @@
 !/tests/frontend.test.mjs
 !/tests/browser.test.mjs
 !/tests/e2e.test.mjs
+!/tests/native.test.mjs
 !/tests/e2e_server.py
 !/tests/requirements.lock
 !/tests/test_artifacts_jobs.py
