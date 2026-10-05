@@ -85,6 +85,8 @@ test("node activity omits finished history and other nodes but preserves work ne
   const jobs = [job("unknown", { state: "unknown", occupied: 0 }),
     job("collecting", { collection_state: "pending" }),
     job("save-error", { collection_state: "error" }),
+    job("partial", { collection_state: "partial" }),
+    job("unavailable", { collection_state: "unavailable" }),
     job("queued", { state: "waiting", worker_id: null }),
     job("working", { state: "outstanding", occupied: 1 }),
     job("other-node", { state: "outstanding", occupied: 1, worker_id: "node-2" }),
@@ -92,7 +94,7 @@ test("node activity omits finished history and other nodes but preserves work ne
     job("hidden", { hidden: true }),
     ...Array.from({ length: 200 }, (_, i) => job(`done-${i}`, { created: i + 2 }))];
   assert.deepEqual(new Set(workerJobs(jobs, "node-1").map(job => job.id)),
-    new Set(["unknown", "collecting", "save-error", "working"]));
+    new Set(["collecting", "working"]));
 });
 
 test("the queue preserves server priority and excludes any assigned or completed work", () => {
@@ -147,8 +149,11 @@ test("preparation remembers the submitted workflow name without editing the grap
 test("cancelled unassigned jobs are cancelled, while incomplete outputs need attention", () => {
   assert.equal(jobStatus({ state: "cancelled", worker_id: null, collection_state: "not_applicable" }), "Cancelled");
   assert.equal(jobStatus({ state: "succeeded", collection_state: "pending" }), "Saving results");
-  assert.equal(jobStatus({ state: "succeeded", collection_state: "error" }), "Results need attention");
-  assert.equal(jobStatus({ state: "unknown", occupied: 0 }), "Needs review");
+  assert.equal(jobStatus({ state: "succeeded", collection_state: "error" }), "Results not saved");
+  assert.equal(jobStatus({ state: "succeeded", collection_state: "partial" }), "Completed with missing results");
+  assert.equal(jobStatus({ state: "succeeded", collection_state: "unavailable" }), "Results unavailable");
+  assert.equal(jobStatus({ state: "unknown", occupied: 0 }), "Cancelled");
+  assert.equal(jobStatus({ state: "unknown", occupied: 1 }), "Checking job");
 });
 
 test("native Run constructs distinct batch IDs on plain HTTP without randomUUID", () => {
@@ -160,7 +165,7 @@ test("native Run constructs distinct batch IDs on plain HTTP without randomUUID"
   const ids = new Set();
   for (let i = 0; i < 100; i++) {
     const body = runInNewContext(statement + '\nbody', {
-      crypto, jobs, args: [-1], createBatchId: () => preparation.createBatchId(crypto),
+      crypto, jobs, source: {nodes: []}, args: [-1], createBatchId: () => preparation.createBatchId(crypto),
     });
     assert.match(body.batch_id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     assert.equal(body.front, true);
@@ -253,3 +258,37 @@ for (const location of ["output", "workflow"]) {
     assert.equal(submitted, 0);
   });
 }
+
+test("authored source is captured before queue callbacks resolve prompts and advance counters", async () => {
+  const values = {prompt:"{a|b}",seed:10};
+  const app = {
+    extensionManager:{workflow:{activeWorkflow:{filename:"Production.json"}}},
+    rootGraph:{serialize:()=>({nodes:[{widgets_values:[values.prompt,values.seed]}]}),
+      nodes:[{widgets:[{beforeQueued(){values.prompt="a"},afterQueued(){values.seed++}}]}]},
+    graphToPrompt:async()=>({output:{1:{class_type:"CustomPrompt",inputs:{...values}}},workflow:app.rootGraph.serialize()}),
+    canvas:{draw(){}},
+  };
+  const source=preparation.captureSource(app);
+  const jobs=await prepareSnapshots(app,()=>{},3);
+  assert.deepEqual(source.nodes[0].widgets_values,["{a|b}",10]);
+  assert.deepEqual(jobs.map(job=>job.output[1].inputs.seed),[10,11,12]);
+  assert(jobs.every(job=>job.output[1].inputs.prompt==="a"));
+  assert.equal(source.extra.fleet.workflow_name,"Production");
+});
+
+test('continuation refuses custom private callbacks and changed native controls without running them', () => {
+  let calls=0;
+  const controls={beforeQueued:'native before',afterQueued:'native after',promoted:'native promoted'};
+  const app={rootGraph:{nodes:[{widgets:[{beforeQueued(){calls++}}]}],serialize(){return {nodes:[]}}}};
+  const saved=preparation.captureContinuation(app,controls);
+  assert.match(saved.error,/custom generation controls/);
+  assert.equal(calls,0);
+  assert.throws(()=>preparation.restoreContinuation(app,()=>calls++,controls,saved),/custom/);
+  const clean={rootGraph:{nodes:[],serialize(){return {nodes:[],extra:{prompt:'{a|b}'}}}}};
+  const checkpoint=preparation.captureContinuation(clean,controls);
+  assert.equal(checkpoint.workflow.extra.prompt,'{a|b}');
+  assert.throws(()=>preparation.restoreContinuation(clean,()=>calls++,{...controls,beforeQueued:'changed'},checkpoint),/controls changed/);
+  clean.ui={settings:{getSettingValue:()=> 'before'}};
+  assert.throws(()=>preparation.restoreContinuation(clean,()=>calls++,controls,checkpoint),/controls changed/);
+  assert.equal(calls,0);
+});

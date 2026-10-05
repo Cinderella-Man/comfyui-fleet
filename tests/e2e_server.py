@@ -32,7 +32,7 @@ main{width:320px;height:100vh}aside{position:fixed;left:350px;top:20px}
 </style></head><body><main><div class="sidebar-content-container"><div id="fleet-mount"></div></div></main><aside>
 <label>Workflow <input id="workflow" value="Portraits.json"></label>
 <label>Jobs <input id="count" type="number" value="4"></label>
-<button id="run">Run</button></aside><section id="notifications" aria-label="Notifications"></section><script type="module">
+<button id="run" data-testid="queue-button">Run</button></aside><section id="notifications" aria-label="Notifications"></section><script type="module">
 import {app} from '/scripts/app.js';
 import '/extensions/ComfyUI-Fleet/fleet.js';
 document.querySelector('#run').onclick=async()=>{
@@ -42,9 +42,13 @@ document.querySelector('#run').onclick=async()=>{
 </script></body></html>"""
 
 APP = """window.nativeNotifications=[];
+const clone=value=>JSON.parse(JSON.stringify(value));
+const initialWorkflow={filename:'Portraits.json',activeState:{nodes:[],extra:{}}};
+const workflowStore={activeWorkflow:initialWorkflow,openWorkflows:[initialWorkflow],
+ async closeWorkflow(workflow){this.openWorkflows=this.openWorkflows.filter(item=>item!==workflow)}};
 export const app={
  registerExtension(extension){extension.setup()},
- extensionManager:{workflow:{activeWorkflow:{filename:'Portraits.json'}},
+ extensionManager:{workflow:workflowStore,
    toast:{add(options){
      window.nativeNotifications.push(options);
      const notice=document.createElement('article');notice.setAttribute('role','status');
@@ -60,8 +64,17 @@ export const app={
    }},
    registerSidebarTab(tab){tab.render(document.querySelector('#fleet-mount'))},
    unregisterSidebarTab(){document.querySelector('#fleet-mount').replaceChildren()}},
- rootGraph:{nodes:[]},canvas:{draw(){}},
- async graphToPrompt(){return {output:{'1':{class_type:'SaveImage',inputs:{}}},workflow:{nodes:[]}}},
+ rootGraph:{nodes:[],extra:{},serialize(){return {nodes:this.nodes,extra:this.extra}}},canvas:{draw(){}},
+ async loadGraphData(graph,clean,view,name){
+   workflowStore.activeWorkflow.activeState=clone(this.rootGraph.serialize());
+   const workflow=name&&typeof name==='object'?name:workflowStore.openWorkflows.find(item=>item.filename===name)||{filename:name||'Unsaved Workflow.json'};
+   const data=clone(graph);
+   this.rootGraph.nodes=data.nodes;this.rootGraph.extra=data.extra||{};
+   workflow.activeState=clone(data);
+   if(!workflowStore.openWorkflows.includes(workflow))workflowStore.openWorkflows.push(workflow);
+   workflowStore.activeWorkflow=workflow;
+ },
+ async graphToPrompt(){return {output:{'1':{class_type:'SaveImage',inputs:{filename_prefix:this.rootGraph.extra.prompt||'test'}}},workflow:this.rootGraph.serialize()}},
  async queuePrompt(){throw new Error('Native queue must be intercepted by Fleet')}
 };
 const toastMode=new URLSearchParams(location.search).get('toast');
@@ -87,14 +100,20 @@ async def serve(app):
 
 class Worker:
     def __init__(self):
+        self.online = True
         self.pending = {"native-job": {}}
         self.history = {}
         self.cancelled = []
+        self.submissions = []
+        self.downloads = []
+        self.download_status = {}
         self.sockets = set()
         self.allow_cancel = asyncio.Event()
         self.allow_cancel.set()
 
     async def handle(self, request):
+        if not self.online:
+            raise web.HTTPServiceUnavailable(text="Node is powered off")
         path = request.path
         if path == "/system_stats":
             answer = {
@@ -107,12 +126,17 @@ class Worker:
             answer = {"SaveImage": {"input": {"required": {}}}}
         elif path == "/prompt":
             data = await request.json()
+            self.submissions.append(data["prompt_id"])
             self.pending[data["prompt_id"]] = data
             answer = {"prompt_id": data["prompt_id"]}
         elif path == "/queue":
             answer = {"queue_running": [[0, key] for key in self.pending], "queue_pending": []}
         elif path == "/view":
-            return web.Response(body=IMAGE, content_type="image/png")
+            status = self.download_status.get(request.query["filename"], 200)
+            self.downloads.append({**request.query, "status": status})
+            return web.Response(
+                status=status, body=IMAGE if status == 200 else b"", content_type="image/png"
+            )
         elif path == "/history":
             if request.method == "POST" and (await request.json()).get("clear"):
                 self.history.clear()
@@ -148,7 +172,7 @@ class Worker:
             else:
                 await socket.send_json(event)
 
-    def complete(self, key, with_results=False):
+    def complete(self, key, with_results=False, outputs=None):
         if key == "native-job" or key not in self.pending:
             raise web.HTTPConflict(text="No such active Fleet prompt")
         self.pending.pop(key)
@@ -158,7 +182,9 @@ class Worker:
                 "completed": True,
                 "messages": [["execution_success", {}]],
             },
-            "outputs": {"1": {"images": [{"filename": "result.png", "type": "output"}]}}
+            "outputs": outputs
+            if outputs is not None
+            else {"1": {"images": [{"filename": "result.png", "type": "output"}]}}
             if with_results
             else {},
         }
@@ -197,7 +223,14 @@ async def main(root, node_count):
 
         async def source(request):
             name = request.match_info["name"]
-            if name not in ("fleet.js", "panel.js", "preparation.js", "progress.js"):
+            if name not in (
+                "fleet.js",
+                "panel.js",
+                "preparation.js",
+                "progress.js",
+                "editing.js",
+                "details.js",
+            ):
                 raise web.HTTPNotFound()
             return web.FileResponse(Path(__file__).resolve().parents[1] / "web" / name)
 
@@ -206,6 +239,7 @@ async def main(root, node_count):
                 "app.js": APP,
                 "api.js": API,
                 "promotedWidgetControl.js": "export function applyPromotedWidgetControl(){}",
+                "widgets.js": "export function addValueControlWidgets(){return [{beforeQueued(){},afterQueued(){}}]}",
             }
             return web.Response(
                 text=modules[request.match_info["name"]], content_type="text/javascript"
@@ -218,6 +252,14 @@ async def main(root, node_count):
             nonlocal control, store
             if request.method == "POST":
                 data = await request.json()
+                if "nodes_online" in data:
+                    for worker in workers.values():
+                        worker.online = data["nodes_online"]
+                        if not worker.online:
+                            worker.pending.clear()
+                            worker.history.clear()
+                            for socket in tuple(worker.sockets):
+                                await socket.close()
                 if "native_history" in data:
                     native_history.update({job["id"]: job for job in data["native_history"]})
                 if "event" in data:
@@ -230,8 +272,9 @@ async def main(root, node_count):
                             else worker.allow_cancel.clear
                         )()
                 if "complete" in data:
+                    workers[data["worker"]].download_status.update(data.get("download_status", {}))
                     workers[data["worker"]].complete(
-                        data["complete"], data.get("with_results", False)
+                        data["complete"], data.get("with_results", False), data.get("outputs")
                     )
                 if data.get("restart"):
                     await control.stop()
@@ -261,6 +304,14 @@ async def main(root, node_count):
                 }
             return web.json_response(counts)
 
+        async def worker_requests(request):
+            return web.json_response(
+                {
+                    name: {"submissions": worker.submissions, "downloads": worker.downloads}
+                    for name, worker in workers.items()
+                }
+            )
+
         async def view(request):
             path = str(Path(request.query.get("subfolder", "")) / request.query["filename"])
             return web.Response(body=read_regular(roots["output"], path), content_type="image/png")
@@ -278,6 +329,7 @@ async def main(root, node_count):
         app.router.add_get("/scripts/{name}", native)
         app.router.add_route("*", "/fixture", fixture)
         app.router.add_get("/fixture/storage", storage)
+        app.router.add_get("/fixture/requests", worker_requests)
         app.router.add_get("/view", view)
         app.router.add_post("/history", history)
         app.router.add_post("/api/history", history)

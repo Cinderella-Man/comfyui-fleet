@@ -497,24 +497,36 @@ test("a failed Cancel active jobs request leaves work intact and can be retried"
   assert.deepEqual((await state()).jobs[1],original[1]);
 });
 
-test("job recovery remains visible only when needed, without routine details or IDs", {timeout:30000}, async t=>{
+test("result errors are reported once without recovery controls or lingering activity", {timeout:30000}, async t=>{
   const workers = [{id:"node-1",url:"http://192.168.1.20:8188",enabled:true}];
   const unknown = fixtureJob(0,{state:"unknown",worker_id:"node-1",occupied:1,submit_intent:1,error:"Connection lost; outcome unknown."});
   const collecting = fixtureJob(1,{state:"succeeded",worker_id:"node-1",collection_state:"error",error:"Could not save the output."});
-  const {page,jobActions} = await setup(t,{workers,jobs:[unknown,collecting]});
+  const {page,jobActions,updateJobs} = await setup(t,{workers,jobs:[unknown,collecting]});
   const region = page.getByRole("region",{name:"Node 1 activity",exact:true});
-  await region.getByText("Connection lost; outcome unknown.",{exact:true}).waitFor();
-  assert.equal(await region.getByText("Could not save the output.",{exact:true}).isVisible(),true);
+  await region.getByText("Checking job",{exact:true}).waitFor();
+  assert.equal(await region.getByText("Fleet is checking this job. If the node no longer has it, it will be dropped and queued work will continue.",{exact:true}).isVisible(),true);
+  assert.equal(await region.getByText("Connection lost; outcome unknown.",{exact:true}).count(),0);
+  await page.getByText(/Could not save the output\. The job is closed\./).waitFor();
+  assert.equal(await region.locator(`[data-job-id="${collecting.id}"]`).count(),0);
   assert.equal(await region.locator("details").count(),0);
   assert.equal(await region.getByText(/Job ID:|Batch ID:|Assigned by Fleet/).count(),0);
   assert.equal(await region.getByRole("button",{name:"View progress",exact:true}).count(),0);
   assert.equal(await region.locator(`[data-job-id="${unknown.id}"]`).getByRole("button",{name:"Cancel job",exact:true}).isEnabled(),true);
   assert.equal(await region.locator(`[data-job-id="${collecting.id}"]`).getByRole("button",{name:"Cancel job",exact:true}).count(),0,"A completed job waiting for recovery cannot be cancelled");
-  const release = page.waitForResponse(response=>response.url().endsWith(`/fleet/jobs/${unknown.id}/release`));
-  await region.getByRole("button",{name:"Verify inactivity and release worker",exact:true}).click();await release;
-  const collect = page.waitForResponse(response=>response.url().endsWith(`/fleet/jobs/${collecting.id}/collect`));
-  await region.getByRole("button",{name:"Retry saving results",exact:true}).click();await collect;
-  assert.deepEqual(jobActions(),[{id:unknown.id,action:"release"},{id:collecting.id,action:"collect"}]);
+  assert.equal(await region.getByRole("button",{name:"Verify inactivity and release worker",exact:true}).count(),0);
+  assert.equal(await page.getByRole("button",{name:"Retry saving results",exact:true}).count(),0);
+  await page.getByRole("button",{name:"Dismiss notification",exact:true}).click();
+  await page.waitForTimeout(300);
+  assert.equal(await page.locator(".fleet-notification").isVisible(),false);
+  assert.deepEqual(jobActions(),[]);
+  updateJobs([{...unknown,state:"cancelled",occupied:0,collection_state:"not_applicable"},
+    {...collecting,collection_state:"partial",error:null},
+    fixtureJob(2,{state:"succeeded",worker_id:"node-1",collection_state:"unavailable"})]);
+  await region.locator(`[data-job-id="${unknown.id}"]`).waitFor({state:"hidden"});
+  await region.locator(`[data-job-id="${collecting.id}"]`).waitFor({state:"hidden"});
+  assert.equal(await region.getByRole("button",{name:"Retry saving results",exact:true}).count(),0);
+  assert.equal(await region.getByText("Results need attention",{exact:true}).count(),0);
+  assert.equal(await region.getByText("Needs review",{exact:true}).count(),0);
 });
 
 test("nodes keep compact job details with a small cancel control alongside the global controls", { timeout: 30000 }, async t => {
@@ -579,19 +591,45 @@ test("Queue shows two workflow batches and the complete job counts instead of in
   assert.equal(await handle.evaluate(el=>el===document.activeElement),true);
 });
 
+for(const batchCount of [1,12]) test(`scrolling over ${batchCount} queued batches moves the panel to the nodes`, {timeout:30000}, async t=>{
+  const workers=Array.from({length:3},(_,i)=>({id:`node-${i+1}`,url:`http://192.168.1.${20+i}:8188`,enabled:true}));
+  const jobs=Array.from({length:batchCount},(_,i)=>fixtureJob(0,{batch_id:`batch-${i}`}));
+  const {page}=await setup(t,{workers,jobs});
+  await page.setViewportSize({width:340,height:520});
+  const panel=page.locator(".fleet-panel");
+  const first=page.locator('.fleet-queue-list li').first();
+  const box=await first.boundingBox();
+  await page.mouse.move(box.x+box.width/2,box.y+box.height/2);
+  await page.mouse.wheel(0,10000);
+  await page.waitForFunction(()=>document.querySelector('.fleet-panel').scrollTop>0,null,{timeout:2000});
+  const node=page.getByRole("switch",{name:"Node 3",exact:true});
+  assert.equal(await node.evaluate(el=>{
+    const box=el.getBoundingClientRect();
+    return box.top>=0&&box.bottom<=innerHeight;
+  }),true,"Wheel scrolling over the queue must reach the nodes below it");
+  const last=page.locator('.fleet-queue-list li').last();
+  await last.scrollIntoViewIfNeeded();
+  const lastBox=await last.boundingBox();
+  await page.mouse.move(lastBox.x+lastBox.width/2,lastBox.y+lastBox.height/2);
+  await page.mouse.wheel(0,-10000);
+  await page.waitForFunction(()=>document.querySelector('.fleet-panel').scrollTop===0,null,{timeout:2000});
+  assert.equal(await panel.evaluate(el=>el.scrollWidth<=el.clientWidth),true);
+});
+
 test("dragging through a long queue scrolls to the edge, saves batch order, and survives reload", {timeout:30000}, async t=>{
   const workers=[{id:"node-1",url:"http://192.168.1.20:8188",enabled:true}];
   const jobs=Array.from({length:12},(_,i)=>fixtureJob(0,{batch_id:`batch-${i}`}));
   const {page,reorders}=await setup(t,{workers,jobs});
   const queue=page.getByRole("region",{name:"Queued Fleet batches",exact:true});
-  assert.equal(await queue.locator("li").count(),12,"All batches share one scrollable list; no pagination barrier");
+  assert.equal(await queue.locator("li").count(),12,"All batches remain in the panel; no pagination barrier");
   assert.equal(await queue.getByRole("button",{name:"Next",exact:true}).count(),0);
   const last=queue.locator('[data-batch-id="batch-11"]').getByRole("button",{name:/^Reorder /});
   await last.scrollIntoViewIfNeeded();
-  const box=await last.boundingBox(),scrollBox=await page.locator(".fleet-queue-scroll").boundingBox();
+  const box=await last.boundingBox(),scrollBox=await page.locator(".fleet-panel").boundingBox();
+  assert.equal(await page.locator(".fleet-panel").evaluate(el=>el.scrollTop>0),true);
   await page.mouse.move(box.x+box.width/2,box.y+box.height/2);await page.mouse.down();
   await page.mouse.move(box.x+box.width/2,scrollBox.y+3,{steps:10});
-  await page.waitForFunction(()=>document.querySelector('.fleet-queue-scroll').scrollTop===0);
+  await page.waitForFunction(()=>document.querySelector('.fleet-panel').scrollTop===0);
   assert.equal(await queue.locator('[data-drop="before"]').first().getAttribute("data-batch-id"),"batch-0");
   await page.waitForResponse(response=>response.url().endsWith('/fleet/state'));
   assert.equal(await queue.locator('[data-dragging="true"]').count(),1,"Polling keeps the dragged card attached");

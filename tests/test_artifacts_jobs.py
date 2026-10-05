@@ -66,11 +66,11 @@ def test_output_collision_100_images_and_byte_identical_retry(artifacts):
         async def download(self, url, ref):
             return ("bytes:" + ref["subfolder"]).encode()
 
-    result = asyncio.run(artifacts.collect(row, Remote()))
+    result = asyncio.run(artifacts.collect(row, Remote())).outputs
     assert not (artifacts.output / row["id"] / "fleet-manifest.json").exists()
     assert len(result["9"]["images"]) == 100
     assert result["9"]["text"] == ["keep metadata"]
-    assert asyncio.run(artifacts.collect(row, Remote())) == result
+    assert asyncio.run(artifacts.collect(row, Remote())).outputs == result
     for i, ref in enumerate(result["9"]["images"]):
         assert read_regular(artifacts.output / row["id"], ref["filename"]) == f"bytes:{i}".encode()
 
@@ -105,7 +105,7 @@ def test_collection_releases_each_file_buffer_before_downloading_the_next(artifa
             return data
 
     remote = Remote()
-    outputs = asyncio.run(artifacts.collect(row, remote))
+    outputs = asyncio.run(artifacts.collect(row, remote)).outputs
     assert remote.previous() is None
     assert len(outputs["1"]["images"]) == 2
 
@@ -139,14 +139,14 @@ def test_shared_output_folders_keep_jobs_branches_and_batches_distinct(artifacts
 
     paths = set()
     for row in rows:
-        output = asyncio.run(artifacts.collect(row, Remote()))
+        output = asyncio.run(artifacts.collect(row, Remote())).outputs
         for ref in output["9"]["images"]:
             expected = "fleet" if layout == "flat" else f"fleet/batch-{row['batch_id']}"
             assert ref["subfolder"] == expected
             path = artifacts.roots["output"] / ref["subfolder"] / ref["filename"]
             paths.add(path)
             assert path.read_bytes().startswith(row["worker_url"].encode())
-        assert asyncio.run(artifacts.collect(row, Remote())) == output
+        assert asyncio.run(artifacts.collect(row, Remote())).outputs == output
     assert len(paths) == 6
     assert len(list(artifacts.output.iterdir())) == (6 if layout == "flat" else 2)
 
@@ -182,7 +182,7 @@ def test_partial_collection_keeps_its_layout_after_reconfiguration(artifacts, la
         output_layout="flat" if layout != "flat" else "batch",
     )
     remote.fail = False
-    output = asyncio.run(restarted.collect(row, remote))
+    output = asyncio.run(restarted.collect(row, remote)).outputs
     assert len(list(artifacts.output.rglob("*.png"))) == 2
     assert first.read_bytes() == b"one.png"
     for ref in output["9"]["images"]:
@@ -207,12 +207,12 @@ def test_shared_output_long_names_and_conflicts(artifacts, layout):
             return self.data
 
     remote = Remote()
-    ref = asyncio.run(artifacts.collect(row, remote))["9"]["images"][0]
+    ref = asyncio.run(artifacts.collect(row, remote)).outputs["9"]["images"][0]
     assert len(ref["filename"].encode()) <= 240
     assert ref["filename"].endswith(".png")
     # A normal-length conflicting result must fail without overwriting.
     row["history"]["outputs"]["9"]["images"][0]["filename"] = "one.png"
-    ref = asyncio.run(artifacts.collect(row, remote))["9"]["images"][0]
+    ref = asyncio.run(artifacts.collect(row, remote)).outputs["9"]["images"][0]
     remote.data = b"different bytes"
     with pytest.raises(ValueError, match="refusing to overwrite"):
         asyncio.run(artifacts.collect(row, remote))
@@ -257,7 +257,7 @@ def test_collection_retry_preserves_legacy_manifest_and_rejects_conflicting_iden
         async def download(self, url, ref):
             return b"image"
 
-    assert asyncio.run(artifacts.collect(row, Remote())) == output
+    assert asyncio.run(artifacts.collect(row, Remote())).outputs == output
     assert read_regular(destination, "fleet-manifest.json") == original
     with pytest.raises(ValueError, match="refusing to overwrite"):
         asyncio.run(artifacts.collect({**row, "remote_id": str(uuid.uuid4())}, Remote()))
@@ -347,3 +347,19 @@ def test_cleared_history_does_not_reappear_under_the_self_workers_remote_id(ledg
     assert ledger.state()["jobs"] == []
     assert ledger.job(row["id"]) is None
     assert ledger.db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_edit_retains_unchanged_input_bytes_and_snapshots_changed_references(artifacts):
+    source = artifacts.roots["input"] / "original.png"
+    source.write_bytes(b"original bytes")
+    graph = {"1": {"class_type": "LoadImage", "inputs": {"image": "original.png"}}}
+    saved = artifacts.snapshot(graph)
+    source.unlink()
+    previous = {"graph": graph, "assets": saved}
+    assert artifacts.snapshot(graph, previous) == saved
+    replacement = artifacts.roots["input"] / "replacement.png"
+    replacement.write_bytes(b"new bytes")
+    edited = {"1": {"class_type": "LoadImage", "inputs": {"image": "replacement.png"}}}
+    changed = artifacts.snapshot(edited, previous)
+    assert changed[0]["sha256"] != saved[0]["sha256"]
+    assert read_regular(artifacts.blobs, changed[0]["sha256"]) == b"new bytes"

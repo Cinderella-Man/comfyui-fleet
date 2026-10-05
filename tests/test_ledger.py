@@ -12,6 +12,7 @@ import fleet.store as store_module
 def batch(count=8):
     return {
         "batch_id": str(uuid.uuid4()),
+        "source": {"nodes": []},
         "jobs": [
             {
                 "output": {"1": {"class_type": "SaveImage", "inputs": {"filename_prefix": "test"}}},
@@ -169,7 +170,10 @@ def test_crash_after_intent_never_allows_second_post(ledger):
         assert row["id"] == a["id"] and row["submit_intent"] == 1
         assert not recovered.begin_submit(row["id"])
         recovered.observe(row["id"], False)
-        assert recovered.job(row["id"])["occupied"] == 1
+        assert recovered.job(row["id"])["state"] == "cancelled"
+        assert recovered.job(row["id"])["occupied"] == 0
+        assert not recovered.begin_submit(row["id"])
+        assert recovered.claim("a")["id"] != row["id"]
     finally:
         recovered.close()
 
@@ -182,7 +186,7 @@ def test_cancellation_preparation_and_late_admission(ledger):
     a = ledger.claim("a")
     assert ledger.begin_submit(a["id"])
     ledger.cancel([a["id"]])
-    ledger.observe(a["id"], False, False)  # still validating remotely
+    # Cancellation while the submission request is still in flight only sets intent.
     assert ledger.job(a["id"])["occupied"]
     ledger.submitted(a["id"], 200, {"prompt_id": a["remote_id"]})
     ledger.observe(a["id"], True, True)  # interrupt was signalled, still running
@@ -284,13 +288,13 @@ def test_retention_keeps_batch_counts_and_receipts_without_finished_job_records(
         assert restored.state()["batch_names"] == {}
         assert restored.state()["suspensions"] == []
         assert admit(restored, value)["job_ids"] == accepted["job_ids"]
-        assert restored.db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert restored.db.execute("PRAGMA user_version").fetchone()[0] == 4
         assert restored.db.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         restored.close()
 
 
-def test_retention_preserves_collection_retry_and_uncertain_submission(ledger):
+def test_retention_retires_collection_errors_but_preserves_uncertain_submission(ledger):
     admit(ledger, batch(3))
     a, b = ledger.claim("a"), ledger.claim("b")
     ledger.begin_submit(a["id"])
@@ -299,11 +303,12 @@ def test_retention_preserves_collection_retry_and_uncertain_submission(ledger):
     ledger.begin_submit(b["id"])
     ledger.submitted(b["id"], None, {})
     ledger.prune()
-    assert ledger.db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 3
-    with pytest.raises(Conflict, match="results to collect"):
-        ledger.configure([{"id": "b", "url": "http://127.0.0.2:8188"}])
-    ledger.action(a["id"], "collect")
-    assert ledger.pending_collection()[0]["id"] == a["id"]
+    assert ledger.db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 2
+    ledger.configure([{"id": "b", "url": "http://127.0.0.2:8188"}])
+    with pytest.raises(Conflict):
+        ledger.action(a["id"], "collect")
+    assert ledger.pending_collection() == []
+    assert ledger.job(a["id"])["error"] == "download failed"
     assert ledger.claim("b")["id"] == b["id"]
     assert not ledger.begin_submit(b["id"])
 
@@ -411,19 +416,17 @@ def test_cancel_everything_preserves_results_and_waits_for_active_acknowledgemen
     assert not ledger.paused()
 
 
-def test_cancel_everything_includes_unknown_occupied_jobs_but_not_released_outcomes(ledger):
+def test_cancel_everything_includes_uncertain_jobs_but_not_dropped_jobs(ledger):
     admit(ledger, batch(2))
     for worker in ("a", "b"):
         row = ledger.claim(worker)
         ledger.begin_submit(row["id"])
         ledger.submitted(row["id"], None, {})
-        ledger.observe(row["id"], True)
-        ledger.observe(row["id"], False)
-    ledger.release_unknown(row["id"])
-    released = ledger.job(row["id"])
+    ledger.observe(row["id"], False)
+    dropped = ledger.job(row["id"])
     assert ledger.cancel_all() == {"cancelled": 1}
     assert ledger.claim("a")["cancel_requested"]
-    assert ledger.job(row["id"]) == released
+    assert ledger.job(row["id"]) == dropped
 
 
 def test_cancel_everything_handles_more_than_one_batch_of_1000_jobs(ledger):
@@ -464,6 +467,56 @@ def test_state_queue_follows_dispatch_priority(ledger):
     assert [row["id"] for row in ledger.state()["jobs"]] == [ids[-1], *ids[:-1]]
 
 
+def test_batch_name_persists_without_changing_jobs_source_order_or_edit_hold(ledger):
+    value = batch(3)
+    value["jobs"][0]["workflow"]["extra"] = {"fleet": {"workflow_name": "Original"}}
+    receipt = admit(ledger, value)
+    ledger.claim("a")
+    ledger.begin_edit(value["batch_id"], str(uuid.uuid4()))
+    jobs, hold = ledger.jobs(), ledger.edit_state()
+    revision = [tuple(row) for row in ledger.db.execute("SELECT * FROM batch_revisions")]
+    assert ledger.rename_batch(value["batch_id"], "  Finals — <v2>  ") == {
+        "batch_id": value["batch_id"],
+        "name": "Finals — <v2>",
+    }
+    assert ledger.jobs() == jobs
+    assert ledger.edit_state() == hold
+    assert [tuple(row) for row in ledger.db.execute("SELECT * FROM batch_revisions")] == revision
+    assert admit(ledger, value)["job_ids"] == receipt["job_ids"]
+    assert ledger.state()["batch_names"][value["batch_id"]] == "Finals — <v2>"
+    root = ledger.root
+    ledger.close()
+    reopened = Ledger(root)
+    try:
+        assert reopened.state()["batch_names"][value["batch_id"]] == "Finals — <v2>"
+        assert reopened.jobs() == jobs
+        assert reopened.edit_state() == hold
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("name", [None, 7, "", "   ", "x" * 201, "a\nb", "a\x00b"])
+def test_invalid_batch_names_preserve_the_existing_name(ledger, name):
+    value = batch(1)
+    admit(ledger, value)
+    ledger.rename_batch(value["batch_id"], "Original")
+    with pytest.raises(ValueError, match="Batch name"):
+        ledger.rename_batch(value["batch_id"], name)
+    assert ledger.state()["batch_names"][value["batch_id"]] == "Original"
+
+
+def test_batch_rename_rejects_a_batch_that_left_the_queue(ledger):
+    value = batch(1)
+    admit(ledger, value)
+    ledger.rename_batch(value["batch_id"], "Original")
+    ledger.claim("a")
+    with pytest.raises(Conflict, match="no longer has queued jobs"):
+        ledger.rename_batch(value["batch_id"], "Too late")
+    with pytest.raises(Conflict, match="no longer has queued jobs"):
+        ledger.rename_batch(str(uuid.uuid4()), "Missing")
+    assert ledger.state()["batch_names"][value["batch_id"]] == "Original"
+
+
 def test_batch_reorder_persists_and_preserves_assigned_and_completed_jobs(ledger):
     first, second, third = batch(4), batch(3), batch(2)
     first["jobs"][0]["workflow"]["extra"] = {"fleet": {"workflow_name": "Portraits"}}
@@ -483,7 +536,7 @@ def test_batch_reorder_persists_and_preserves_assigned_and_completed_jobs(ledger
     ledger.close()
     reopened = Ledger(root)
     try:
-        assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 4
         assert reopened.state()["batch_names"] == {first["batch_id"]: "Portraits"}
         claimed = []
         for _ in range(7):
@@ -565,12 +618,11 @@ def test_cancel_batch_preserves_later_batch_and_completed_outputs(ledger):
     assert ledger.claim("a")["batch_id"] == second["batch_id"]
 
 
-def test_unknown_stays_reserved_and_configuration_cannot_orphan_it(ledger):
+def test_unchecked_submission_stays_reserved_and_configuration_cannot_orphan_it(ledger):
     admit(ledger, batch(2))
     a = ledger.claim("a")
     ledger.begin_submit(a["id"])
     ledger.submitted(a["id"], None, {})
-    ledger.observe(a["id"], False)
     assert ledger.claim("a")["id"] == a["id"]
     with pytest.raises(Conflict):
         ledger.action(a["id"], "retry")
@@ -578,7 +630,7 @@ def test_unknown_stays_reserved_and_configuration_cannot_orphan_it(ledger):
         ledger.configure([])
 
 
-def test_collection_retry_is_not_execution_and_old_jobs_cannot_be_resubmitted(ledger):
+def test_failed_collection_cannot_be_retried_or_resubmitted(ledger):
     admit(ledger, batch(1))
     a = ledger.claim("a")
     ledger.begin_submit(a["id"])
@@ -587,9 +639,10 @@ def test_collection_retry_is_not_execution_and_old_jobs_cannot_be_resubmitted(le
         ledger.action(a["id"], "retry")
     assert ledger.job(a["id"])["state"] == "failed"
     ledger.collected(a["id"], None, "download failed")
-    ledger.action(a["id"], "collect")
+    with pytest.raises(Conflict):
+        ledger.action(a["id"], "collect")
     assert len(ledger.jobs()) == 1
-    assert ledger.job(a["id"])["collection_state"] == "pending"
+    assert ledger.job(a["id"])["collection_state"] == "error"
 
 
 def test_single_owner_node_backup_and_existing_restore_pause(tmp_path):
@@ -649,28 +702,26 @@ def test_sqlite_full_rolls_back_entire_batch_and_recovers(tmp_path):
         store.close()
 
 
-def test_manual_capacity_release_requires_settled_submission(ledger):
+def test_observed_submission_clears_uncertainty_then_drops_if_it_disappears(ledger):
     admit(ledger, batch(1))
     row = ledger.claim("a")
     ledger.begin_submit(row["id"])
     ledger.submitted(row["id"], None, {})
-    with pytest.raises(Conflict):
-        ledger.release_unknown(row["id"])
-    ledger.observe(row["id"], True)
-    ledger.observe(row["id"], False)
-    ledger.release_unknown(row["id"])
     assert ledger.job(row["id"])["state"] == "unknown"
+    ledger.observe(row["id"], True)
+    assert ledger.job(row["id"])["state"] == "outstanding"
+    assert ledger.job(row["id"])["error"] is None
+    ledger.observe(row["id"], False)
+    assert ledger.job(row["id"])["state"] == "cancelled"
     assert ledger.job(row["id"])["occupied"] == 0
-    assert ledger.job(row["id"])["collection_state"] == "unavailable"
+    assert ledger.job(row["id"])["collection_state"] == "not_applicable"
 
 
-def test_successful_collection_retry_clears_transfer_error_only(ledger):
+def test_successful_collection_finishes_without_recovery(ledger):
     admit(ledger, batch(1))
     row = ledger.claim("a")
     ledger.begin_submit(row["id"])
     ledger.finish(row["id"], history())
-    ledger.collected(row["id"], None, "temporary download failure")
-    ledger.action(row["id"], "collect")
     ledger.collected(row["id"], {"99": {"images": []}})
     final = ledger.job(row["id"])
     assert final["state"] == "succeeded" and final["error"] is None

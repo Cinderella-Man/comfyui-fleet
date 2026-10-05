@@ -21,9 +21,12 @@ files = [
         "fleet/http.py",
         "fleet/jobs.py",
         "fleet/store.py",
+        "fleet/snapshots.py",
         "fleet/validation.py",
         "fleet/worker.py",
         "web/fleet.js",
+        "web/editing.js",
+        "web/details.js",
         "web/panel.js",
         "web/preparation.js",
         "web/progress.js",
@@ -35,7 +38,7 @@ files = [
         "docs/USAGE.md",
     )
 ]
-archive = destination / "ComfyUI-Fleet-0.1.0.tar.gz"
+archive = destination / "ComfyUI-Fleet-0.2.0.tar.gz"
 with (
     archive.open("wb") as stream,
     gzip.GzipFile(filename="", fileobj=stream, mode="wb", mtime=0) as compressed,
@@ -49,7 +52,7 @@ with (
             with path.open("rb") as source:
                 tar.addfile(info, source)
 manifest = {
-    "version": "0.1.0",
+    "version": "0.2.0",
     "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
     "files": {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
 }

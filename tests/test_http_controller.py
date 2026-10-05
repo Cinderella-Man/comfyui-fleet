@@ -14,10 +14,314 @@ from fleet.artifacts import Artifacts
 from fleet.controller import Controller
 import fleet.controller as controller_module
 from fleet.http import Routes
-from fleet.store import Store
+from fleet.jobs import job as native_job
+from fleet.store import Conflict, Store
 from fleet.worker import Remote, hardware_info, redirect_guard
 import fleet.worker as worker_module
 from test_ledger import batch, history
+
+
+@pytest.mark.parametrize("preview_node", ["10", "66"])
+@pytest.mark.parametrize(
+    "missing_type,http_status,with_final,execution_ok,expected",
+    [
+        ("temp", 404, True, True, "collected"),
+        ("temp", 404, False, True, "unavailable"),
+        ("temp", 404, False, False, "unavailable"),
+        ("output", 404, True, True, "partial"),
+        ("output", 404, False, True, "unavailable"),
+        ("input", 404, True, True, "partial"),
+        ("output", 410, True, True, "partial"),
+        ("temp", 500, True, True, "error"),
+    ],
+)
+def test_collection_errors_finish_without_recovery(
+    tmp_path, preview_node, missing_type, http_status, with_final, execution_ok, expected
+):
+    async def scenario():
+        requests = []
+
+        async def view(request):
+            ref = dict(request.query)
+            requests.append(ref)
+            if ref["filename"] == "missing.png":
+                return web.Response(status=http_status)
+            return web.Response(body=b"final image")
+
+        app = web.Application()
+        app.router.add_get("/view", view)
+        runner, url = await server(app)
+        store = Store(tmp_path / "state")
+        await store.open()
+        roots = {kind: tmp_path / kind for kind in ("input", "output", "temp")}
+        for path in roots.values():
+            path.mkdir()
+        artifacts = Artifacts(tmp_path / "state", roots)
+        task = None
+        try:
+            await store.call("configure", [{"id": "one", "url": url}])
+            await store.call("admit", batch(1), [[]], [["one"]])
+            row = await store.call("claim", "one")
+            await store.call("begin_submit", row["id"])
+            await store.call("submitted", row["id"], 200, {"prompt_id": row["remote_id"]})
+            reported = history(execution_ok)
+            reported["outputs"] = {
+                preview_node: {"images": [{"filename": "missing.png", "type": missing_type}]}
+            }
+            if with_final:
+                reported["outputs"]["12"] = {
+                    "images": [{"filename": "final.png", "type": "output"}],
+                    "text": ["keep metadata"],
+                }
+            await store.call("finish", row["id"], reported)
+            async with aiohttp.ClientSession() as session:
+                control = Controller(store, Remote(session), artifacts, lambda event: None)
+                task = asyncio.create_task(control.collection_loop())
+
+                async def finished():
+                    return (await store.call("job", row["id"]))["collection_state"] != "pending"
+
+                await until(finished)
+                saved = await store.call("job", row["id"])
+                assert saved["collection_state"] == expected, saved["error"]
+                assert saved["history"] == reported
+                assert saved["state"] == ("succeeded" if execution_ok else "failed")
+                if expected != "error":
+                    assert saved["outputs"][preview_node]["images"] == []
+                    missing = saved["diagnostics"]["missing_results"]
+                    assert len(missing) == 1
+                    assert missing[0]["filename"] == "missing.png"
+                    assert missing[0]["type"] == missing_type
+                    if with_final:
+                        ref = saved["outputs"]["12"]["images"][0]
+                        assert ref["filename"] == (
+                            "0002-final.png" if preview_node == "10" else "0001-final.png"
+                        )
+                        assert ref["type"] == "output"
+                        assert (
+                            roots["output"] / ref["subfolder"] / ref["filename"]
+                        ).read_bytes() == b"final image"
+                        assert saved["outputs"]["12"]["text"] == ["keep metadata"]
+                    if execution_ok:
+                        assert saved["error"] is None
+                    assert native_job(saved)["status"] == (
+                        "failed"
+                        if not execution_ok
+                        else "cancelled"
+                        if expected == "unavailable"
+                        else "completed"
+                    )
+                    with pytest.raises(Conflict):
+                        await store.call("action", row["id"], "collect")
+                    # No retained recovery blocks node removal or finished-job cleanup.
+                    assert await store.call("configure", []) == []
+                    await store.call("prune")
+                    assert (await store.call("job", row["id"]))["outputs"] == saved["outputs"]
+                    assert (await store.call("job", row["id"]))["diagnostics"] == saved[
+                        "diagnostics"
+                    ]
+                    assert await store.call("pending_collection") == []
+                else:
+                    assert "missing.png" in saved["error"]
+                    assert f"HTTP {http_status}" in saved["error"]
+                    with pytest.raises(Conflict):
+                        await store.call("action", row["id"], "collect")
+                    assert await store.call("pending_collection") == []
+                    assert await store.call("configure", []) == []
+                    await store.call("prune")
+                    assert (await store.call("job", row["id"]))["error"] == saved["error"]
+                assert (
+                    next(ref for ref in requests if ref["filename"] == "missing.png")["type"]
+                    == missing_type
+                )
+                assert sum(ref["filename"] == "missing.png" for ref in requests) == 1
+        finally:
+            if task:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await store.close()
+            await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("receipt", ["acknowledged", "observed", "unconfirmed", "interrupted"])
+@pytest.mark.parametrize("restart_controller", [False, True])
+def test_returning_nodes_drop_missing_jobs_and_continue_queue(
+    tmp_path, receipt, restart_controller
+):
+    async def scenario():
+        store = Store(tmp_path / "state")
+        await store.open()
+        workers = ["a", "b", "c"]
+
+        class ReturningNodes:
+            online = False
+
+            async def get(self, url, path):
+                if not self.online:
+                    raise OSError("Node is offline")
+                if path.startswith("/history/"):
+                    return {}
+                assert path == "/queue"
+                return {"queue_running": [], "queue_pending": []}
+
+            async def request(self, *args):
+                if args[1].startswith("/api/jobs/") and args[1].endswith("/cancel"):
+                    return 200, {"cancelled": False}
+                pytest.fail("Reconciliation must never resubmit the missing job")
+
+        remote = ReturningNodes()
+        try:
+            await store.call(
+                "configure",
+                [
+                    {"id": worker, "url": f"http://127.0.0.{index + 1}:8188"}
+                    for index, worker in enumerate(workers)
+                ],
+            )
+            value = batch(9)
+            accepted = await store.call("admit", value, [[]] * 9, [workers] * 9)
+            active = []
+            for worker in workers:
+                row = await store.call("claim", worker)
+                await store.call("begin_submit", row["id"])
+                if receipt == "interrupted":
+                    # The controller stopped before recording the submission's
+                    # outcome. Cancelling the missing remote identity returns false.
+                    await store.call("cancel", [row["id"]])
+                else:
+                    await store.call(
+                        "submitted",
+                        row["id"],
+                        200 if receipt == "acknowledged" else None,
+                        {"prompt_id": row["remote_id"]} if receipt == "acknowledged" else {},
+                    )
+                if receipt == "observed":
+                    await store.call("observe", row["id"], True)
+                active.append(await store.call("job", row["id"]))
+            waiting_ids = set(accepted["job_ids"]) - {row["id"] for row in active}
+            if restart_controller:
+                await store.close()
+                store = Store(tmp_path / "state")
+                await store.open()
+            control = Controller(store, remote, None, lambda event: None)
+            for row in active:
+                with pytest.raises(OSError, match="offline"):
+                    await control.observe(row)
+                assert (await store.call("job", row["id"]))["occupied"] == 1
+            assert {
+                row["id"]
+                for row in (await store.call("state"))["jobs"]
+                if row["state"] == "waiting"
+            } == waiting_ids
+
+            remote.online = True
+            for row in active:
+                await control.observe(row)
+                dropped = await store.call("job", row["id"])
+                assert dropped["state"] == "cancelled"
+                assert dropped["occupied"] == 0 and dropped["ended"] is not None
+                assert dropped["collection_state"] == "not_applicable"
+                assert not await store.call("begin_submit", row["id"])
+                await store.call("finish", row["id"], history())
+                assert await store.call("job", row["id"]) == dropped
+            state = await store.call("state")
+            assert state["suspensions"] == []
+            assert state["batch_counts"][value["batch_id"]]["cancelled"] == 3
+            assert {row["id"] for row in state["jobs"] if row["state"] == "waiting"} == waiting_ids
+            for worker in workers:
+                next_job = await store.call("claim", worker)
+                assert next_job["id"] in waiting_ids
+                waiting_ids.remove(next_job["id"])
+            await store.call("prune")
+            assert (await store.call("state"))["batch_counts"][value["batch_id"]]["cancelled"] == 3
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "reported",
+    [
+        "running",
+        "pending",
+        "history",
+        "history_race",
+        "offline",
+        "queue_error",
+        "second_history_error",
+    ],
+)
+def test_reconciliation_preserves_reported_jobs_and_waits_for_complete_checks(tmp_path, reported):
+    async def scenario():
+        store = Store(tmp_path / "state")
+        await store.open()
+        try:
+            await store.call("configure", [{"id": "one", "url": "http://127.0.0.1:8188"}])
+            await store.call("admit", batch(2), [[], []], [["one"], ["one"]])
+            active = await store.call("claim", "one")
+            await store.call("begin_submit", active["id"])
+            await store.call("submitted", active["id"], None, {})
+
+            class Reports:
+                reads = 0
+
+                async def get(self, url, path):
+                    if reported == "offline":
+                        raise OSError("Node is offline")
+                    if path.startswith("/history/"):
+                        self.reads += 1
+                        if reported == "second_history_error" and self.reads == 2:
+                            raise OSError("History check failed")
+                        if reported == "history" or reported == "history_race" and self.reads == 2:
+                            return {active["remote_id"]: history()}
+                        return {}
+                    assert path == "/queue"
+                    if reported == "queue_error":
+                        raise OSError("Queue check failed")
+                    return {
+                        "queue_running": [[0, active["remote_id"]]]
+                        if reported == "running"
+                        else [],
+                        "queue_pending": [[0, active["remote_id"]]]
+                        if reported == "pending"
+                        else [],
+                    }
+
+            remote = Reports()
+            control = Controller(store, remote, None, lambda event: None)
+            if reported in {"offline", "queue_error", "second_history_error"}:
+                with pytest.raises(OSError):
+                    await control.observe(active)
+            else:
+                await control.observe(active)
+            row = await store.call("job", active["id"])
+            if reported in {"history", "history_race"}:
+                assert row["state"] == "succeeded" and row["occupied"] == 0
+                assert row["collection_state"] == "pending"
+            else:
+                assert row["occupied"] == 1
+                assert row["state"] == (
+                    "outstanding" if reported in {"running", "pending"} else "unknown"
+                )
+            assert (
+                len(
+                    [
+                        job
+                        for job in (await store.call("state"))["jobs"]
+                        if job["state"] == "waiting"
+                    ]
+                )
+                == 1
+            )
+            if reported == "history_race":
+                assert remote.reads == 2
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
 
 
 def test_worker_releases_delivered_event_while_waiting_for_next_message(monkeypatch):
@@ -1453,5 +1757,95 @@ def test_http_and_websocket_redirects_never_reach_the_target():
         finally:
             await redirect_runner.cleanup()
             await target_runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+def test_resize_preserves_inputs_and_failed_growth_keeps_jobs_name_and_hold(tmp_path):
+    from test_editing import credentials, resizable_batch
+
+    async def scenario():
+        roots = {name: tmp_path / name for name in ("input", "output", "temp")}
+        for path in roots.values():
+            path.mkdir()
+        original = b"original input bytes"
+        (roots["input"] / "one.png").write_bytes(original)
+        artifacts = Artifacts(tmp_path / "state", roots)
+        store = Store(tmp_path / "state")
+        await store.open()
+
+        class Compatible(Remote):
+            available = True
+
+            async def compatible(self, *args):
+                if not self.available:
+                    raise OSError("Worker offline")
+                return []
+
+        remote = Compatible(None)
+        control = Controller(store, remote, artifacts, lambda event: None)
+        try:
+            await store.call("configure", [{"id": "one", "url": "http://127.0.0.1:8188"}])
+            value = resizable_batch(2)
+            graph = {"1": {"class_type": "LoadImage", "inputs": {"image": "one.png"}}}
+            for job in value["jobs"]:
+                job["output"] = graph
+            await control.admit(value)
+            before = await store.call("jobs")
+            # A resize retains unchanged input bytes even after the original changes.
+            (roots["input"] / "one.png").write_bytes(b"changed on disk")
+            edit = await store.call("begin_edit", value["batch_id"], str(uuid.uuid4()), "details")
+            details = {"name": "Updated name", "total": 4}
+            draft = await store.call(
+                "save_draft", {**credentials(edit), "version": 0, "source": details}
+            )
+            request = {
+                **credentials(edit),
+                "batch_id": value["batch_id"],
+                "operation_id": str(uuid.uuid4()),
+                "version": draft["version"],
+                "source": details,
+                "jobs": value["jobs"],
+                "continuation": value["continuation"],
+            }
+            remote.available = False
+            with pytest.raises(ValueError, match="No compatible worker"):
+                await control.save_details(request)
+            assert await store.call("jobs") == before
+            state = await store.call("state")
+            assert state["edit"]["id"] == edit["id"]
+            assert state["batch_counts"][value["batch_id"]]["total"] == 2
+            assert value["batch_id"] not in state["batch_names"]
+            remote.available = True
+            answer = await control.save_details(request)
+            assert answer["added"] == 2
+            assert (await control.save_details(request))["replayed"]
+            jobs = await store.call("jobs")
+            assert len(jobs) == 4
+            assert jobs[:2] == before
+            assert all(job["assets"] == before[0]["assets"] for job in jobs)
+            assert (artifacts.blobs / jobs[-1]["assets"][0]["sha256"]).read_bytes() == original
+            # Shrinking needs no reachable worker and updates the total rather than cancellations.
+            edit = await store.call("begin_edit", value["batch_id"], str(uuid.uuid4()), "details")
+            details = {"name": "Empty", "total": 0}
+            version = await store.call(
+                "save_draft", {**credentials(edit), "version": 0, "source": details}
+            )
+            remote.available = False
+            shrunk = await control.save_details(
+                {
+                    **credentials(edit),
+                    "batch_id": value["batch_id"],
+                    "operation_id": str(uuid.uuid4()),
+                    "version": version["version"],
+                    "source": details,
+                    "jobs": [],
+                }
+            )
+            assert shrunk["removed"] == 4
+            assert await store.call("jobs") == []
+            assert list(artifacts.blobs.iterdir()) == []
+        finally:
+            await store.close()
 
     asyncio.run(scenario())

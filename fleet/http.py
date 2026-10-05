@@ -55,7 +55,15 @@ class Routes:
             ("POST", "/queue/reorder", self.reorder_queue),
             ("POST", "/backup", self.backup),
             ("POST", "/batches", self.admit),
+            ("POST", "/edit/begin", self.begin_edit),
+            ("POST", "/edit/draft", self.save_draft),
+            ("POST", "/edit/touch", self.touch_edit),
+            ("POST", "/edit/release", self.release_edit_owner),
+            ("POST", "/edit/discard", self.discard_edit),
+            ("POST", "/edit/save", self.save_edit),
+            ("POST", "/edit/details", self.save_details),
             ("GET", "/batches/{batch_id}", self.batch),
+            ("POST", "/batches/{batch_id}/rename", self.rename_batch),
             ("POST", "/batches/{batch_id}/cancel", self.cancel_batch),
             ("POST", "/batches/{batch_id}/reenable", self.reenable),
             ("POST", "/jobs/cancel", self.cancel),
@@ -166,11 +174,49 @@ class Routes:
     async def admit(self, request):
         return web.json_response(await self.ready().admit(await body(request)))
 
+    async def begin_edit(self, request):
+        data = await body(request)
+        return web.json_response(
+            await self.ready().store.call(
+                "begin_edit", data["batch_id"], data["owner"], data.get("kind", "workflow")
+            )
+        )
+
+    async def save_draft(self, request):
+        return web.json_response(await self.ready().store.call("save_draft", await body(request)))
+
+    async def touch_edit(self, request):
+        return web.json_response(await self.ready().store.call("touch_edit", await body(request)))
+
+    async def release_edit_owner(self, request):
+        return web.json_response(
+            await self.ready().store.call("release_edit_owner", await body(request))
+        )
+
+    async def discard_edit(self, request):
+        return web.json_response(await self.ready().store.call("discard_edit", await body(request)))
+
+    async def save_edit(self, request):
+        return web.json_response(await self.ready().save_edit(await body(request)))
+
+    async def save_details(self, request):
+        return web.json_response(await self.ready().save_details(await body(request)))
+
     async def batch(self, request):
         result = await self.ready().store.call("batch", request.match_info["batch_id"])
         if result is None:
             raise web.HTTPNotFound()
         return web.json_response(result)
+
+    async def rename_batch(self, request):
+        data = await body(request)
+        if not isinstance(data, dict) or data.keys() != {"name"}:
+            raise ValueError("Expected a batch name")
+        return web.json_response(
+            await self.ready().store.call(
+                "rename_batch", request.match_info["batch_id"], data["name"]
+            )
+        )
 
     async def cancel_batch(self, request):
         await body(request)

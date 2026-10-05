@@ -11,15 +11,18 @@ const pageSize = 10;
 
 export function jobStatus(job) {
   if (!terminal.has(job.state) && job.cancel_requested) return "Cancelling";
-  if (job.state === "unknown") return "Needs review";
-  if (job.collection_state === "error") return "Results need attention";
+  if (job.state === "unknown") return job.occupied ? "Checking job" : "Cancelled";
+  if (job.collection_state === "error") return "Results not saved";
+  if (job.collection_state === "partial") return "Completed with missing results";
+  if (job.collection_state === "unavailable") return "Results unavailable";
   if (terminal.has(job.state) && job.collection_state === "pending") return "Saving results";
   return { waiting: "Queued", preparing: "Preparing", outstanding: "In progress",
     succeeded: "Completed", failed: "Failed", cancelled: "Cancelled" }[job.state] ?? "Needs review";
 }
 
 function needsAttention(job) {
-  return !terminal.has(job.state) || job.occupied || ["pending", "error"].includes(job.collection_state);
+  if (job.state === "unknown" && !job.occupied) return false;
+  return !terminal.has(job.state) || job.occupied || job.collection_state === "pending";
 }
 
 function stepProgress(job, snapshot = {}) {
@@ -363,6 +366,7 @@ export class FleetPanel {
     this.actions = actions;
     this.queueRows = new Map();
     this.workerPages = new Map();
+    this.reportedCollectionErrors = new Set();
     this.cancellingQueue = false;
     this.cancellingBatches = new Set();
     this.cancellingActive = false;
@@ -409,7 +413,7 @@ export class FleetPanel {
     this.cancelQueueButton.addEventListener("click", () => this.cancelQueued());
     queueHeading.append(queueTitle, this.cancelQueueButton);
     this.queueHint = element("p", null, { className: "fleet-queue-hint" });
-    this.queueBody = element("div", null, { className: "fleet-queue-scroll" });
+    this.queueBody = element("div", null, { className: "fleet-queue-body" });
     this.queueList = element("ol", null, { className: "fleet-queue-list" });
     this.queueEmpty = element("p", "No batches waiting", { className: "fleet-queue-empty" });
     this.queueBody.append(this.queueList, this.queueEmpty);
@@ -427,9 +431,9 @@ export class FleetPanel {
     const nodeDragHelp = element("span", "Press Space to pick up a node, use arrow keys to move it, then Space to save. Escape cancels.", { className: "fleet-sr-only", id: "fleet-node-drag-help" });
     const orderingDisabled = () => this.editing || this.workerSaving || this.cancellingActive || this.cancellingQueuedJobs || !this.state?.ready;
     const renderOrder = () => { this.renderQueue(); this.renderWorkers(); };
-    this.queueOrder = new ReorderList({ list: this.queueList, scroller: this.queueBody, rows: this.queueRows,
+    this.queueOrder = new ReorderList({ list: this.queueList, scroller: this.root, rows: this.queueRows,
       key: "batchId", subject: "Batch", plural: "batches", descriptionId: "fleet-drag-help",
-      isDisabled: () => orderingDisabled() || this.workerOrder.busy, render: renderOrder,
+      isDisabled: () => Boolean(this.state?.edit) || orderingDisabled() || this.workerOrder.busy, render: renderOrder,
       announce: (text, error) => this.queueMessage(text, error),
       notify: text => this.notify(text),
       save: (id, before) => this.actions.reorderBatch(id, before), reload: () => this.actions.retry?.() });
@@ -616,6 +620,8 @@ export class FleetPanel {
       .fleet-panel .fleet-confirm h3{margin:0 0 10px;font-size:18px;line-height:1.4;overflow-wrap:anywhere}
       .fleet-panel .fleet-confirm p{margin:0 0 18px;color:var(--fleet-muted)}
       .fleet-panel .fleet-confirm footer{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px}
+      .fleet-panel .fleet-rename-field{margin-bottom:18px}
+      .fleet-panel .fleet-rename-error{color:#f2a6a6}
       .fleet-panel .fleet-version-notice{border:1px solid rgba(226,177,106,.3);border-radius:14px;padding:20px;background:linear-gradient(145deg,rgba(226,177,106,.075),var(--fleet-surface) 65%);margin:0 0 20px;overflow-wrap:anywhere}
       .fleet-panel .fleet-version-icon{display:grid;place-items:center;width:40px;height:40px;border:1px solid rgba(226,177,106,.25);border-radius:12px;background:rgba(226,177,106,.1);color:#e2b16a;margin-bottom:18px}
       .fleet-panel .fleet-version-icon svg{width:22px;height:22px}
@@ -638,12 +644,24 @@ export class FleetPanel {
       .fleet-panel .fleet-queue-count{font-size:11px;color:var(--fleet-muted);font-weight:400}
       .fleet-panel .fleet-queue-heading button{font-size:11px;padding:5px 8px;min-height:30px}
       .fleet-panel .fleet-queue-hint{font-size:12px;line-height:1.65;color:var(--fleet-muted);margin:0 0 12px}
-      .fleet-panel .fleet-queue-scroll{max-height:48vh;overflow-y:auto;overscroll-behavior:contain;padding:3px;margin:-3px;scrollbar-width:thin}
+      .fleet-panel .fleet-queue-body{padding:3px;margin:-3px}
       .fleet-panel .fleet-queue-list{list-style:none;margin:0;padding:0;display:grid;gap:8px}
       .fleet-panel .fleet-batch{position:relative;display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;gap:10px;padding:12px 10px;border:1px solid var(--fleet-line);border-radius:10px;background:var(--fleet-surface)}
       .fleet-panel .fleet-batch strong{display:block;font-size:12px;font-weight:550;overflow-wrap:anywhere;line-height:1.5}
       .fleet-panel .fleet-batch small{display:block;font-size:10px;line-height:1.5;color:var(--fleet-muted);margin-top:3px}
-      .fleet-panel .fleet-batch-footer{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:6px}
+      .fleet-panel .fleet-batch-heading>strong{min-width:0;overflow-wrap:anywhere}.fleet-panel .fleet-batch-heading>strong input{margin:0}.fleet-panel .fleet-batch-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.fleet-batch-menu{position:relative;flex:none}
+.fleet-batch-menu summary{cursor:pointer;list-style:none;font-size:22px;padding:0 6px;border-radius:5px}
+.fleet-batch-menu[open] summary{background:var(--comfy-input-bg,#333)}
+.fleet-batch-menu .fleet-batch-actions{position:absolute;right:0;top:100%;display:flex;flex-direction:column;white-space:nowrap;z-index:20;padding:4px;border:1px solid var(--fleet-line);border-radius:8px;background:var(--comfy-menu-bg,#222);box-shadow:0 4px 16px #0008}
+.fleet-batch-menu .fleet-batch-actions button{text-align:left;border-color:transparent}
+.fleet-edit-shield{position:fixed;z-index:999;display:grid;place-items:center;background:#111b;color:#eee;font:16px system-ui;cursor:wait}
+.fleet-edit-shield[hidden]{display:none}
+.fleet-edit-bar{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:1000;display:flex;align-items:center;gap:12px;padding:12px 16px;max-width:calc(100vw - 32px);border:1px solid #777;border-radius:10px;background:var(--comfy-menu-bg,#222);color:var(--input-text,#eee);box-shadow:0 4px 20px #0008;font:14px system-ui}
+.fleet-edit-bar[hidden]{display:none}
+.fleet-edit-bar button{white-space:nowrap;padding:8px 12px;border:1px solid #777;border-radius:6px;background:var(--comfy-input-bg,#333);color:inherit;cursor:pointer}
+.fleet-edit-bar button:disabled{opacity:.5;cursor:default}
+.fleet-batch-footer{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:6px}
       .fleet-panel .fleet-batch-footer small{margin:0;min-width:0}
       .fleet-panel .fleet-batch-footer button{flex:none;font-size:10px;padding:4px 7px;min-height:28px}
       .fleet-panel .fleet-batch-count{font-size:11px;color:var(--fleet-text);margin:7px 0 0;line-height:1.5}
@@ -1059,11 +1077,11 @@ export class FleetPanel {
     this.status.hidden = !text || Boolean(issue) || (this.editing && !error);
   }
 
-  notify(text) {
+  notify(text, severity = "success") {
     this.dismissNotification();
     // Older hosts can lack the optional toast interface. Keep their feedback
     // temporary too, separately from errors and in-progress action messages.
-    try { if (this.actions.notify?.(text)) return; } catch { /* Use the inline fallback. */ }
+    try { if (this.actions.notify?.(text, severity)) return; } catch { /* Use the inline fallback. */ }
     this.notificationText.textContent = text;
     this.notification.hidden = false;
     this.notificationTimer = setTimeout(() => this.dismissNotification(), 5000);
@@ -1101,6 +1119,42 @@ export class FleetPanel {
       dialog.addEventListener("close", () => finish(false));
       dialog.showModal(); keep.focus();
     });
+  }
+
+  renameInline(row) {
+    if (row.renaming || !this.state.ready) return;
+    row.renaming = true;
+    const input = element("input", null, { type: "text", value: row.batch.name, maxLength: 200 });
+    input.setAttribute("aria-label", "Batch name");
+    row.name.replaceChildren(input);
+    let busy = false, closed = false;
+    const finish = () => {
+      closed = true; row.renaming = false;
+      row.name.textContent = row.batch.name;
+    };
+    const save = async () => {
+      if (busy || closed) return;
+      if (!input.value.trim()) {
+        input.setAttribute("aria-invalid", "true");
+        this.queueMessage("Batch name cannot be empty.", true);
+        return;
+      }
+      if (input.value.trim() === row.batch.name) { finish(); return; }
+      busy = true; input.disabled = true;
+      try {
+        await this.actions.renameBatch(row.batch.id, input.value.trim());
+        finish(); this.queueMessage("");
+      } catch (error) {
+        this.queueMessage(`Could not rename batch. ${error.message}`, true);
+      } finally { busy = false; input.disabled = false; }
+    };
+    input.addEventListener("blur", save);
+    input.addEventListener("keydown", event => {
+      if (event.key === "Enter") { event.preventDefault(); save(); }
+      if (event.key === "Escape" && !busy) { event.preventDefault(); finish(); this.queueMessage(""); }
+    });
+    input.addEventListener("input", () => input.removeAttribute("aria-invalid"));
+    input.focus(); input.select();
   }
 
   async saveBackup() {
@@ -1157,14 +1211,9 @@ export class FleetPanel {
       const error = element("p", this.jobCancellationErrors.get(job.id));
       error.setAttribute("role", "alert"); recovery.append(error);
     }
-    if (job.error) recovery.append(element("p", job.error));
+    if (job.error && job.state !== "unknown") recovery.append(element("p", job.error));
     if (job.state === "unknown" && job.occupied) {
-      recovery.append(element("p", "The outcome is uncertain. Verify the worker is idle before releasing its reserved slot."),
-        this.button("Verify inactivity and release worker", () => this.actions.jobAction(job.id, "release")));
-    }
-    if (job.collection_state === "error") {
-      recovery.append(element("p", "Retry saving the results without executing the workflow again."),
-        this.button("Retry saving results", () => this.actions.jobAction(job.id, "collect")));
+      recovery.append(element("p", "Fleet is checking this job. If the node no longer has it, it will be dropped and queued work will continue."));
     }
     if (recovery.childElementCount) article.append(recovery);
     return article;
@@ -1214,7 +1263,7 @@ export class FleetPanel {
   }
 
   renderCancellation() {
-    // An unknown job whose slot was manually released is retained for review, not running.
+    // Legacy unknown jobs whose slots were released are no longer active.
     const active = this.state.jobs.filter(job => !terminal.has(job.state) && job.occupied);
     const remaining = active.filter(job => !job.cancel_requested);
     this.cancelActiveButton.disabled = this.cancellingActive || this.cancellingJobs.size > 0 || this.cancellingQueuedJobs || this.queueOrder.busy || this.workerOrder.busy || !remaining.length || !this.state.ready;
@@ -1296,9 +1345,39 @@ export class FleetPanel {
     cancel.title = "Cancel queued jobs in this batch. Active jobs keep running.";
     const footer = element("div", null, { className: "fleet-batch-footer" });
     footer.append(status, cancel);
-    copy.append(name, time, count, progress, footer);
+    const heading = element("div", null, { className: "fleet-batch-heading" });
+    const menu = element("details", null, { className: "fleet-batch-menu" });
+    const toggle = element("summary", "⋯");
+    toggle.setAttribute("aria-label", `Batch actions for ${batch.name}`);
+    const rename = this.button("Edit batch", async () => {
+      menu.open = false;
+      try { await this.actions.editBatchDetails(batch.id); }
+      catch (error) { this.queueMessage(error.message, true); }
+    });
+    const edit = this.button("Edit workflow", async () => {
+      menu.open = false;
+      try { await this.actions.editBatch(batch.id); }
+      catch (error) { this.queueMessage(error.message, true); }
+    });
+    edit.className = "fleet-edit-workflow";
+    menu.addEventListener("keydown", event => { if (event.key === "Escape") { menu.open = false; toggle.focus(); } });
+    const discard = this.button("Discard changes and resume", async () => {
+      menu.open = false;
+      if (!await this.confirmAction("Discard batch changes?", "The batch will keep its saved name, size and workflow, and queue scheduling will resume.", "Discard changes")) return;
+      try { await this.actions.discardBatchEdit(batch.id); }
+      catch (error) { this.queueMessage(error.message, true); }
+    });
+    discard.className = "fleet-discard-edit";
+    const actions = element("div", null, { className: "fleet-batch-actions" });
+    actions.append(rename, edit, discard);
+    menu.append(toggle, actions);
+    heading.append(name, menu);
+    copy.append(heading, time, count, progress, footer);
     root.append(handle, copy);
-    return { root, handle, name, time, count, progress, status, cancel };
+    const row = { batch, root, handle, name, time, count, progress, status, cancel, toggle, rename, edit, discard };
+    name.title = "Double-click to rename";
+    name.addEventListener("dblclick", () => this.renameInline(row));
+    return row;
   }
 
   renderQueue() {
@@ -1306,11 +1385,11 @@ export class FleetPanel {
     const batches = queuedBatches(this.state.jobs, this.state.batch_names, this.state.batch_counts);
     const waiting = batches.reduce((sum, batch) => sum + batch.queued, 0);
     this.queueCount.textContent = `${batches.length} batch${batches.length === 1 ? "" : "es"}`;
-    const busy = this.queueOrder.saving || this.workerOrder.busy || this.cancellingActive || this.cancellingQueuedJobs;
-    const batchBusy = id => this.queueOrder.busy || this.workerOrder.busy || this.cancellingActive || this.cancellingQueue || this.cancellingBatches.has(id) || !this.state.ready;
+    const busy = Boolean(this.state.edit) || this.queueOrder.saving || this.workerOrder.busy || this.cancellingActive || this.cancellingQueuedJobs;
+    const batchBusy = id => this.state.edit?.batch_id === id || this.queueOrder.busy || this.workerOrder.busy || this.cancellingActive || this.cancellingQueue || this.cancellingBatches.has(id) || !this.state.ready;
     this.cancelQueueButton.disabled = busy || Boolean(this.queueOrder.drag) || !waiting || !this.state.ready;
     this.cancelQueueButton.textContent = this.cancellingQueue ? "Cancelling…" : "Cancel queued jobs";
-    this.queueHint.textContent = this.state.paused ? "Scheduling is stopped. Complete the recovery steps before starting new work." :
+    this.queueHint.textContent = this.state.edit ? "A batch is being edited. Earlier work can continue; this batch and everything after it are held. Queue order is locked." : this.state.paused ? "Scheduling is stopped. Complete the recovery steps before starting new work." :
       batches.length ? "Drag batches to change what goes next. Active jobs keep running." : "Use ComfyUI’s Run button to add work.";
     this.queueList.setAttribute("aria-busy", String(this.queueOrder.saving || this.cancellingQueue));
     for (const [id, row] of this.queueRows) row.cancel.disabled = batchBusy(id);
@@ -1325,8 +1404,17 @@ export class FleetPanel {
     batches.forEach((batch, index) => {
       let row = this.queueRows.get(batch.id);
       if (!row) { row = this.createBatchRow(batch); this.queueRows.set(batch.id, row); }
+      Object.assign(row.batch, batch);
       if (this.queueList.children[index] !== row.root) this.queueList.insertBefore(row.root, this.queueList.children[index] ?? null);
-      row.name.textContent = batch.name;
+      if (!row.renaming) row.name.textContent = batch.name;
+      row.toggle.setAttribute("aria-label", `Batch actions for ${batch.name}`);
+      const held = this.state.edit?.batch_id === batch.id;
+      const detailsHeld = held && this.state.edit.kind === "details";
+      row.rename.textContent = detailsHeld ? "Resume editing" : "Edit batch";
+      row.rename.disabled = !this.state.ready || Boolean(this.state.edit && !detailsHeld) || this.cancellingQueue || this.cancellingBatches.has(batch.id);
+      row.discard.hidden = this.state.edit?.batch_id !== batch.id;
+      row.edit.textContent = held && !detailsHeld ? "Resume editing" : "Edit workflow";
+      row.edit.disabled = !this.state.ready || Boolean(this.state.edit && (!held || detailsHeld));
       row.handle.setAttribute("aria-label", `Reorder ${batch.name}`);
       row.handle.disabled = busy || !this.state.ready || batches.length < 2;
       row.cancel.disabled = batchBusy(batch.id);
@@ -1336,7 +1424,7 @@ export class FleetPanel {
       renderBatchProgress(row, batch);
       row.status.textContent = [batch.active && `${batch.active} active`, `${batch.queued} queued`,
         batch.failed && `${batch.failed} failed`, batch.cancelled && `${batch.cancelled} cancelled`,
-        batch.review && `${batch.review} need review`].filter(Boolean).join(" · ");
+        batch.review && `${batch.review} checking`].filter(Boolean).join(" · ");
     });
   }
 
@@ -1485,5 +1573,17 @@ export class FleetPanel {
     if (this.editing) this.renderDraftHardware();
     this.renderQueue();
     this.renderWorkers();
+    const errors = state.jobs.filter(job => !job.hidden && terminal.has(job.state) &&
+      ["error", "partial", "unavailable"].includes(job.collection_state));
+    const fresh = errors.filter(job => !this.reportedCollectionErrors.has(job.id));
+    this.reportedCollectionErrors = new Set(errors.map(job => job.id));
+    if (fresh.length) {
+      const job = fresh[0];
+      const name = state.batch_names?.[job.batch_id] || "Workflow batch";
+      const detail = job.error || (job.collection_state === "partial" ?
+        "Some result files were unavailable; available results were saved." : "Result files were unavailable.");
+      this.notify(fresh.length === 1 ? `“${name}”: ${detail} The job is closed.` :
+        `${fresh.length} jobs had errors saving results and were closed. See history for details.`, "warn");
+    }
   }
 }

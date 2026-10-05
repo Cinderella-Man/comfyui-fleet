@@ -1,4 +1,4 @@
-"""Frozen schema-1 fixture: upgrades must preserve work already accepted by Fleet."""
+"""Upgrade drops waiting work once, preserving assigned jobs and admission receipts."""
 
 import asyncio
 import copy
@@ -15,9 +15,88 @@ from fleet.validation import canonical
 from test_ledger import batch, history
 
 
+@pytest.mark.parametrize(
+    "error", ["ValueError: Result download failed: HTTP 404", "OSError: offline"]
+)
+def test_old_collection_errors_finish_without_recovery_after_restart(tmp_path, error):
+    root = tmp_path / "state"
+    store = Ledger(root)
+    try:
+        store.configure([{"id": "one", "url": "http://127.0.0.1:8188"}])
+        store.admit(batch(2), [[], []], [["one"], ["one"]])
+        row = store.claim("one")
+        store.begin_submit(row["id"])
+        store.finish(row["id"], history())
+        store.collected(row["id"], None, error)
+        store.close()
+        store = Ledger(root)
+        assert store.pending_collection() == []
+        assert store.job(row["id"])["error"] == error
+        assert store.claim("one")["id"] != row["id"]
+        with pytest.raises(Conflict):
+            store.action(row["id"], "collect")
+        store.prune()
+        assert store.job(row["id"])["error"] == error
+        assert store.db.execute("SELECT 1 FROM jobs WHERE id=?", (row["id"],)).fetchone() is None
+    finally:
+        store.close()
+
+
+def test_previously_released_jobs_become_cancelled_without_releasing_unchecked_work(tmp_path):
+    root = tmp_path / "state"
+    store = Ledger(root)
+    try:
+        store.configure(
+            [
+                {"id": worker, "url": f"http://127.0.0.{i + 1}:8188"}
+                for i, worker in enumerate(("a", "b"))
+            ]
+        )
+        value = batch(5)
+        store.admit(value, [[]] * 5, [["a", "b"]] * 5)
+
+        def old_released_job():
+            row = store.claim("a")
+            store.begin_submit(row["id"])
+            store.submitted(row["id"], None, {})
+            with store.db:
+                store.db.execute(
+                    "UPDATE jobs SET occupied=0,collection_state='unavailable' WHERE id=?",
+                    (row["id"],),
+                )
+            return row["id"]
+
+        old_released_job()
+        store.prune()  # One released outcome only remains in durable batch counts.
+        released = old_released_job()
+        active = store.claim("a")
+        store.begin_submit(active["id"])
+        store.submitted(active["id"], None, {})
+        waiting = {job["id"] for job in store.waiting_jobs()}
+        assert len(waiting) == 2
+        store.close()
+
+        for _ in range(2):
+            store = Ledger(root)
+            assert store.job(active["id"])["state"] == "unknown"
+            assert store.job(active["id"])["occupied"] == 1
+            assert {job["id"] for job in store.waiting_jobs()} == waiting
+            counts = store.state()["batch_counts"][value["batch_id"]]
+            assert counts == {"total": 5, "completed": 0, "failed": 0, "cancelled": 2, "review": 1}
+            if store.job(released):
+                assert store.job(released)["state"] == "cancelled"
+                assert store.job(released)["ended"] is not None
+                assert store.job(released)["collection_state"] == "not_applicable"
+            store.prune()
+            store.close()
+    finally:
+        store.close()
+
+
 def legacy_ledger(root):
     root.mkdir()
     value = batch(4)
+    del value["source"]
     legacy = {"batch_id": value["batch_id"], "runs": value["jobs"]}
     ids = [str(uuid.uuid4()) for _ in range(4)]
     with sqlite3.connect(root / "fleet.sqlite") as db:
@@ -101,11 +180,13 @@ def test_upgrade_preserves_job_identities_and_backs_up_only_nodes(tmp_path):
     value, legacy, original = legacy_ledger(root)
     store = Ledger(root)
     try:
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 4
         assert store.db.execute("PRAGMA foreign_key_check").fetchall() == []
-        assert [
-            dict(row) for row in store.db.execute("SELECT * FROM jobs ORDER BY ordinal")
-        ] == original
+        upgraded = [dict(row) for row in store.db.execute("SELECT * FROM jobs ORDER BY ordinal")]
+        assert upgraded[:3] == original[:3]
+        assert upgraded[3]["state"] == "cancelled"
+        assert upgraded[3]["collection_state"] == "not_applicable"
+        assert not store.waiting_jobs()
         state = store.state()
         assert [job["id"] for job in state["jobs"]] == [row["id"] for row in reversed(original)]
         assert state["events"][0]["job_id"] == original[0]["id"]
@@ -144,7 +225,7 @@ def test_retention_cleans_legacy_history_without_losing_recovery_or_admission_re
     store = Ledger(root)
     try:
         store.prune()
-        assert store.db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 3
+        assert store.db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 2
         assert store.db.execute("PRAGMA foreign_key_check").fetchall() == []
         assert store.state()["batch_counts"][value["batch_id"]]["failed"] == 1
         assert store.job(original[2]["id"])["outputs"], "Collected results stay in session history"

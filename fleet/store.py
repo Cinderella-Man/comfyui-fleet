@@ -8,6 +8,7 @@ import asyncio
 import copy
 from concurrent.futures import ThreadPoolExecutor
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,18 @@ import sqlite3
 import time
 import uuid
 
-from .validation import TERMINAL, batch_digests, canonical, identity, prepared_batch, workers_config
+from .jobs import output_summary
+from .snapshots import difference, reconstruct
+from .validation import (
+    TERMINAL,
+    batch_details,
+    batch_digests,
+    canonical,
+    identity,
+    prepared_batch,
+    source_workflow,
+    workers_config,
+)
 
 JSON_FIELDS = {"graph", "workflow", "assets", "history", "outputs", "diagnostics", "eligible"}
 HISTORY_LIMIT = 10000  # Stock ComfyUI keeps a bounded, in-memory history too.
@@ -61,7 +73,7 @@ class Ledger:
             (self.root / "fleet.sqlite").chmod(0o600)
             self.db.row_factory = sqlite3.Row
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3, 4):
                 raise ValueError("Unsupported Fleet schema; no automatic downgrade")
             self.db.execute("PRAGMA journal_mode=DELETE")
             self.db.execute("PRAGMA synchronous=EXTRA")
@@ -76,6 +88,7 @@ class Ledger:
                     self.db.execute("ALTER TABLE events RENAME COLUMN run_id TO job_id")
                     self.db.execute("PRAGMA user_version=2")
             self.db.executescript("""
+                BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 INSERT OR IGNORE INTO settings VALUES('paused','false');
                 CREATE TABLE IF NOT EXISTS workers(
@@ -109,13 +122,66 @@ class Ledger:
                     batch_id TEXT PRIMARY KEY REFERENCES batches(id), name TEXT,
                     completed INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
                     cancelled INTEGER NOT NULL DEFAULT 0, review INTEGER NOT NULL DEFAULT 0);
-                PRAGMA user_version=2;
+                CREATE TABLE IF NOT EXISTS batch_revisions(
+                    id TEXT PRIMARY KEY, batch_id TEXT NOT NULL REFERENCES batches(id),
+                    source TEXT NOT NULL, base TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS job_snapshots(
+                    job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+                    revision_id TEXT NOT NULL REFERENCES batch_revisions(id), delta TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS batch_edit(
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1), id TEXT NOT NULL,
+                    batch_id TEXT NOT NULL REFERENCES batches(id), owner TEXT NOT NULL,
+                    token TEXT NOT NULL, expires REAL NOT NULL, draft TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 0, updated REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS edit_receipts(
+                    id TEXT PRIMARY KEY, digest TEXT NOT NULL, answer TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS batch_preparation(
+                    batch_id TEXT PRIMARY KEY REFERENCES batches(id),
+                    continuation TEXT, next_ordinal INTEGER NOT NULL);
+
             """)
             with self.db:
+                if "total" not in {
+                    r[1] for r in self.db.execute("PRAGMA table_info(batch_progress)")
+                }:
+                    self.db.execute(
+                        "ALTER TABLE batch_progress ADD COLUMN total INTEGER NOT NULL DEFAULT 0"
+                    )
+                    self.db.execute(
+                        "UPDATE batch_progress SET total=(SELECT json_array_length(job_ids) "
+                        "FROM batch_receipts WHERE batch_id=batch_progress.batch_id)"
+                    )
+                if "kind" not in {r[1] for r in self.db.execute("PRAGMA table_info(batch_edit)")}:
+                    self.db.execute(
+                        "ALTER TABLE batch_edit ADD COLUMN kind TEXT NOT NULL DEFAULT 'workflow'"
+                    )
                 for row in self.db.execute(
                     "SELECT id FROM batches WHERE id NOT IN (SELECT batch_id FROM batch_receipts)"
                 ).fetchall():
                     self._record_batch(row["id"])
+                self.db.execute(
+                    "INSERT OR IGNORE INTO batch_preparation SELECT batch_id,NULL,total FROM batch_progress"
+                )
+                if version in (1, 2):
+                    # No conversion: only work already assigned survives the upgrade.
+                    self.db.execute(
+                        "UPDATE jobs SET state='cancelled',cancel_requested=1,ended=?,"
+                        "collection_state='not_applicable' WHERE state='waiting' "
+                        "AND worker_id IS NULL AND occupied=0 AND submit_intent=0",
+                        (time.time(),),
+                    )
+                # Older versions released missing jobs without resolving their
+                # outcome. Treat those already-free slots as dropped work too.
+                self.db.execute(
+                    "UPDATE jobs SET state='cancelled',ended=COALESCE(ended,?),"
+                    "collection_state='not_applicable',error=NULL "
+                    "WHERE state='unknown' AND occupied=0",
+                    (time.time(),),
+                )
+                self.db.execute(
+                    "UPDATE batch_progress SET cancelled=cancelled+review,review=0 WHERE review>0"
+                )
+                self.db.execute("PRAGMA user_version=4")
             if (self.root / "restore-pause").exists():
                 self.pause(True)
         except BaseException:
@@ -140,7 +206,7 @@ class Ledger:
             "DELETE FROM events WHERE seq NOT IN (SELECT seq FROM events ORDER BY seq DESC LIMIT 200)"
         )
 
-    def _record_batch(self, batch_id):
+    def _record_batch(self, batch_id, name=None):
         rows = self.db.execute(
             "SELECT id,json_extract(workflow,'$.extra.fleet.workflow_name') AS name "
             "FROM jobs WHERE batch_id=? ORDER BY ordinal",
@@ -150,11 +216,339 @@ class Ledger:
             "INSERT INTO batch_receipts VALUES(?,?)",
             (batch_id, canonical([row["id"] for row in rows])),
         )
-        name = rows[0]["name"] if rows else None
+        if name is None:
+            name = rows[0]["name"] if rows else None
         self.db.execute(
-            "INSERT INTO batch_progress(batch_id,name) VALUES(?,?)",
-            (batch_id, name.strip()[:200] if isinstance(name, str) else None),
+            "INSERT INTO batch_progress(batch_id,name,total) VALUES(?,?,?)",
+            (batch_id, name.strip()[:200] if isinstance(name, str) else None, len(rows)),
         )
+        self.db.execute("INSERT INTO batch_preparation VALUES(?,NULL,?)", (batch_id, len(rows)))
+
+    def _decode_job(self, row):
+        item = decode(row)
+        if item is None:
+            return None
+        snapshot = self.db.execute(
+            "SELECT r.base,s.delta FROM job_snapshots s JOIN batch_revisions r "
+            "ON r.id=s.revision_id WHERE s.job_id=?",
+            (item["id"],),
+        ).fetchone()
+        if snapshot:
+            pair = reconstruct(json.loads(snapshot["base"]), json.loads(snapshot["delta"]))
+            item.update(graph=pair["output"], workflow=pair["workflow"])
+        return item
+
+    def _save_revision(self, body, ids):
+        revision = str(uuid.uuid4())
+        base = body["jobs"][0]
+        self.db.execute(
+            "INSERT INTO batch_revisions VALUES(?,?,?,?)",
+            (revision, body["batch_id"], canonical(body["source"]), canonical(base)),
+        )
+        for job_id, pair in zip(ids, body["jobs"], strict=True):
+            self.db.execute(
+                "INSERT INTO job_snapshots VALUES(?,?,?) "
+                "ON CONFLICT(job_id) DO UPDATE SET revision_id=excluded.revision_id,delta=excluded.delta",
+                (job_id, revision, difference(base, pair)),
+            )
+        self.db.execute(
+            "UPDATE batch_preparation SET continuation=? WHERE batch_id=?",
+            (canonical(body.get("continuation")), body["batch_id"]),
+        )
+
+    def edit_state(self):
+        row = self.db.execute(
+            "SELECT id,batch_id,owner,expires,version,updated,kind FROM batch_edit"
+        ).fetchone()
+        return dict(row) if row else None
+
+    def _edit_jobs(self, batch_id):
+        return [
+            self._decode_job(row)
+            for row in self.db.execute(
+                "SELECT * FROM jobs WHERE batch_id=? AND state='waiting' AND worker_id IS NULL "
+                "AND occupied=0 AND submit_intent=0 ORDER BY ordinal",
+                (batch_id,),
+            ).fetchall()
+        ]
+
+    def _owned_edit(self, body):
+        row = self.db.execute("SELECT * FROM batch_edit").fetchone()
+        if not row or row["id"] != body["edit_id"] or row["token"] != body["token"]:
+            raise Conflict("This edit session is no longer current. Resume it from the queue.")
+        return row
+
+    def begin_edit(self, batch_id, owner, kind="workflow"):
+        identity(batch_id)
+        identity(owner)
+        if kind not in ("workflow", "details"):
+            raise ValueError("Unknown batch edit kind")
+        with self.db:
+            old = self.db.execute("SELECT * FROM batch_edit").fetchone()
+            now = time.time()
+            if old:
+                if old["batch_id"] != batch_id:
+                    raise Conflict("Finish or discard the current batch edit first")
+                if old["owner"] != owner and old["expires"] > now:
+                    raise Conflict("This batch is being edited in another browser tab")
+                self.db.execute(
+                    "UPDATE batch_edit SET owner=?,token=?,expires=?",
+                    (owner, str(uuid.uuid4()), now + 20),
+                )
+            else:
+                rows = self._edit_jobs(batch_id)
+                if not rows:
+                    raise Conflict("This batch no longer has queued jobs")
+                revision = self.db.execute(
+                    "SELECT source FROM batch_revisions r JOIN job_snapshots s ON r.id=s.revision_id "
+                    "WHERE s.job_id=?",
+                    (rows[0]["id"],),
+                ).fetchone()
+                if revision is None:
+                    raise Conflict("This batch has no authored workflow")
+                details = self.db.execute(
+                    "SELECT name,total FROM batch_progress WHERE batch_id=?", (batch_id,)
+                ).fetchone()
+                draft = (
+                    canonical(
+                        {
+                            "name": details["name"] or f"Batch {batch_id[:8]}",
+                            "total": details["total"],
+                        }
+                    )
+                    if kind == "details"
+                    else revision["source"]
+                )
+                self.db.execute(
+                    "INSERT INTO batch_edit(singleton,id,batch_id,owner,token,expires,draft,version,updated,kind) VALUES(1,?,?,?,?,?,?,0,?,?)",
+                    (
+                        str(uuid.uuid4()),
+                        batch_id,
+                        owner,
+                        str(uuid.uuid4()),
+                        now + 20,
+                        draft,
+                        now,
+                        kind,
+                    ),
+                )
+            row = dict(self.db.execute("SELECT * FROM batch_edit").fetchone())
+            row["draft"] = json.loads(row["draft"])
+            row["count"] = len(self._edit_jobs(batch_id))
+            if row["kind"] == "details":
+                row["total"] = self.db.execute(
+                    "SELECT total FROM batch_progress WHERE batch_id=?", (batch_id,)
+                ).fetchone()[0]
+                row["minimum"] = row["total"] - row["count"]
+                prepared = self.db.execute(
+                    "SELECT continuation FROM batch_preparation WHERE batch_id=?", (batch_id,)
+                ).fetchone()
+                row["continuation"] = json.loads(prepared[0]) if prepared and prepared[0] else None
+            return row
+
+    def save_draft(self, body):
+        with self.db:
+            row = self._owned_edit(body)
+            (batch_details if row["kind"] == "details" else source_workflow)(body["source"])
+            if row["version"] == body["version"] + 1 and row["draft"] == canonical(body["source"]):
+                return {"version": row["version"]}
+            if row["version"] != body["version"]:
+                raise Conflict("The saved draft changed. Resume the latest draft from the queue.")
+            now = time.time()
+            self.db.execute(
+                "UPDATE batch_edit SET draft=?,version=version+1,updated=?,expires=?",
+                (canonical(body["source"]), now, now + 20),
+            )
+            return {"version": row["version"] + 1}
+
+    def touch_edit(self, body):
+        with self.db:
+            self._owned_edit(body)
+            self.db.execute("UPDATE batch_edit SET expires=?", (time.time() + 20,))
+        return {"ok": True}
+
+    def release_edit_owner(self, body):
+        with self.db:
+            row = self._owned_edit(body)
+            if "source" in body and row["version"] == body["version"]:
+                (batch_details if row["kind"] == "details" else source_workflow)(body["source"])
+                self.db.execute(
+                    "UPDATE batch_edit SET draft=?,version=version+1,updated=?",
+                    (canonical(body["source"]), time.time()),
+                )
+            self.db.execute("UPDATE batch_edit SET expires=0")
+        return {"ok": True}
+
+    def discard_edit(self, body):
+        with self.db:
+            self._owned_edit(body)
+            self.db.execute("DELETE FROM batch_edit")
+        return {"discarded": True}
+
+    def edit_receipt(self, body):
+        identity(body["operation_id"])
+        digest = hashlib.sha256(canonical(body).encode()).hexdigest()
+        row = self.db.execute(
+            "SELECT * FROM edit_receipts WHERE id=?", (body["operation_id"],)
+        ).fetchone()
+        if row:
+            if row["digest"] != digest:
+                raise Conflict("Save identity was already used for a different edit")
+            return {**json.loads(row["answer"]), "replayed": True}
+        return None
+
+    def prepare_edit(self, body):
+        row = self._owned_edit(body)
+        if row["kind"] != "workflow":
+            raise Conflict("This is a batch details edit")
+        if row["batch_id"] != body["batch_id"] or row["version"] != body["version"]:
+            raise Conflict("The saved draft changed. Resume it before saving.")
+        if canonical(body["source"]) != row["draft"]:
+            raise Conflict("Save the authored draft before preparing its jobs")
+        jobs = self._edit_jobs(row["batch_id"])
+        if len(jobs) != len(body["jobs"]):
+            raise Conflict("The queued job count changed; reload the draft")
+        return jobs
+
+    def commit_edit(self, body, assets, eligible):
+        with self.db:
+            prior = self.edit_receipt(body)
+            if prior:
+                return prior
+            rows = self.prepare_edit(body)
+            if len(assets) != len(rows) or len(eligible) != len(rows) or not all(eligible):
+                raise ValueError("Every job needs a compatible enrolled worker")
+            ids = [row["id"] for row in rows]
+            self._save_revision(body, ids)
+            for job_id, files, workers in zip(ids, assets, eligible, strict=True):
+                self.db.execute(
+                    "UPDATE jobs SET assets=?,eligible=? WHERE id=?",
+                    (canonical(files), canonical(workers), job_id),
+                )
+            # An edited graph gets a fresh compatibility decision on every worker.
+            self.db.execute("DELETE FROM suspensions WHERE batch_id=?", (body["batch_id"],))
+            self.db.execute("DELETE FROM batch_edit")
+            answer = {"saved": True, "batch_id": body["batch_id"], "job_ids": ids}
+            self.db.execute(
+                "INSERT INTO edit_receipts VALUES(?,?,?)",
+                (
+                    body["operation_id"],
+                    hashlib.sha256(canonical(body).encode()).hexdigest(),
+                    canonical(answer),
+                ),
+            )
+            self.event("batch_edited", detail={"batch_id": body["batch_id"], "count": len(ids)})
+            return answer
+
+    def prepare_details(self, body):
+        row = self._owned_edit(body)
+        if (
+            row["kind"] != "details"
+            or row["batch_id"] != body["batch_id"]
+            or row["version"] != body["version"]
+        ):
+            raise Conflict("The saved draft changed. Resume it before saving.")
+        details = batch_details(body["source"])
+        if canonical(body["source"]) != row["draft"]:
+            raise Conflict("Save the batch details draft before preparing jobs")
+        jobs = self._edit_jobs(row["batch_id"])
+        if not jobs:
+            raise Conflict("This batch no longer has queued jobs")
+        total = self.db.execute(
+            "SELECT total FROM batch_progress WHERE batch_id=?", (row["batch_id"],)
+        ).fetchone()[0]
+        if details["total"] < total - len(jobs):
+            raise ValueError(
+                f"Total jobs cannot be below {total - len(jobs)}; started jobs cannot be removed"
+            )
+        added = max(0, details["total"] - total)
+        if not isinstance(body.get("jobs"), list) or len(body["jobs"]) != added:
+            raise ValueError(f"Expected exactly {added} additional jobs")
+        if added:
+            saved = self.db.execute(
+                "SELECT continuation FROM batch_preparation WHERE batch_id=?", (row["batch_id"],)
+            ).fetchone()[0]
+            state = json.loads(saved) if saved else None
+            if not state or state.get("error"):
+                raise Conflict("This batch cannot grow safely. Submit a new batch instead.")
+            if not body.get("continuation") or body["continuation"].get("error"):
+                raise ValueError("Additional jobs must include their next preparation state")
+        return jobs
+
+    def commit_details(self, body, assets, eligible):
+        with self.db:
+            prior = self.edit_receipt(body)
+            if prior:
+                return prior
+            rows = self.prepare_details(body)
+            details = batch_details(body["source"])
+            batch_id = body["batch_id"]
+            total = self.db.execute(
+                "SELECT total FROM batch_progress WHERE batch_id=?", (batch_id,)
+            ).fetchone()[0]
+            added = max(0, details["total"] - total)
+            if len(assets) != added or len(eligible) != added or not all(eligible):
+                raise ValueError("Every added job needs a compatible enrolled worker")
+            removed = rows[-(total - details["total"]) :] if details["total"] < total else []
+            for job in removed:
+                self.db.execute("DELETE FROM jobs WHERE id=?", (job["id"],))
+            ids = []
+            if added:
+                source = self.db.execute(
+                    "SELECT source FROM batch_revisions r JOIN job_snapshots s ON r.id=s.revision_id WHERE s.job_id=?",
+                    (rows[-1]["id"],),
+                ).fetchone()[0]
+                ordinal = self.db.execute(
+                    "SELECT next_ordinal FROM batch_preparation WHERE batch_id=?", (batch_id,)
+                ).fetchone()[0]
+                # Make space immediately after this batch, before all later queued work.
+                priority = max(row["priority"] for row in rows)
+                self.db.execute(
+                    "UPDATE jobs SET priority=priority+? WHERE state='waiting' AND priority>?",
+                    (added, priority),
+                )
+                for index, (files, workers) in enumerate(zip(assets, eligible, strict=True)):
+                    job_id = str(uuid.uuid4())
+                    ids.append(job_id)
+                    self.db.execute(
+                        "INSERT INTO jobs(id,batch_id,ordinal,priority,created,graph,workflow,assets,eligible) VALUES(?,?,?,?,?,'{}','{}',?,?)",
+                        (
+                            job_id,
+                            batch_id,
+                            ordinal + index,
+                            priority + index + 1,
+                            rows[-1]["created"],
+                            canonical(files),
+                            canonical(workers),
+                        ),
+                    )
+                self._save_revision({**body, "source": json.loads(source)}, ids)
+                self.db.execute(
+                    "UPDATE batch_preparation SET next_ordinal=? WHERE batch_id=?",
+                    (ordinal + added, batch_id),
+                )
+            self.db.execute(
+                "UPDATE batch_progress SET name=?,total=? WHERE batch_id=?",
+                (details["name"], details["total"], batch_id),
+            )
+            self.db.execute("DELETE FROM batch_edit")
+            answer = {
+                "saved": True,
+                "batch_id": batch_id,
+                "total": details["total"],
+                "added": len(ids),
+                "removed": len(removed),
+            }
+            self.db.execute(
+                "INSERT INTO edit_receipts VALUES(?,?,?)",
+                (
+                    body["operation_id"],
+                    hashlib.sha256(canonical(body).encode()).hexdigest(),
+                    canonical(answer),
+                ),
+            )
+            self.event("batch_details_saved", detail=answer)
+            return answer
 
     def workers(self):
         workers = {r["id"]: dict(r) for r in self.db.execute("SELECT * FROM workers ORDER BY id")}
@@ -202,12 +596,12 @@ class Ledger:
             for key in changed:
                 if self.db.execute(
                     "SELECT 1 FROM jobs WHERE worker_id=? AND (occupied=1 "
-                    "OR (history IS NOT NULL AND collection_state IN ('pending','error')))",
+                    "OR (history IS NOT NULL AND collection_state='pending'))",
                     (key,),
                 ).fetchone():
                     raise Conflict(
                         f"“{key}” still has an active job or results to collect. "
-                        "Let it finish, cancel its job, or resolve its recovery warning first. "
+                        "Let it finish or cancel its job first. "
                         "You can disable the node to stop new assignments."
                     )
             for row in self.db.execute("SELECT id,eligible FROM jobs WHERE state='waiting'"):
@@ -283,6 +677,7 @@ class Ledger:
                 if old["digest"] not in digests:
                     raise Conflict("Batch identity was already used for different settings")
                 return {**old, "replayed": True}
+            source_workflow(body.get("source"))
             if self.paused():
                 raise Conflict("Scheduler is paused; no new jobs accepted")
             if (
@@ -293,6 +688,8 @@ class Ledger:
                 raise ValueError("Every job needs a compatible enrolled worker")
             now = time.time()
             last = self.db.execute("SELECT COALESCE(MAX(priority),0) FROM jobs").fetchone()[0]
+            if body.get("front") and self.edit_state():
+                raise Conflict("Queue order is locked while a batch is being edited")
             if body.get("front"):
                 last = (
                     self.db.execute("SELECT COALESCE(MIN(priority),0) FROM jobs").fetchone()[0]
@@ -303,7 +700,7 @@ class Ledger:
                 "INSERT INTO batches(id,digest,created) VALUES(?,?,?)",
                 (body["batch_id"], digests[0], now),
             )
-            for i, job in enumerate(body["jobs"]):
+            for i in range(len(body["jobs"])):
                 self.db.execute(
                     """INSERT INTO jobs(id,batch_id,ordinal,priority,created,graph,workflow,assets,eligible)
                                 VALUES(?,?,?,?,?,?,?,?,?)""",
@@ -313,13 +710,25 @@ class Ledger:
                         i,
                         last + i + 1,
                         now,
-                        canonical(job["output"]),
-                        canonical(job["workflow"]),
+                        "{}",
+                        "{}",
                         canonical(assets[i]),
                         canonical(eligible[i]),
                     ),
                 )
-            self._record_batch(body["batch_id"])
+            extra = body["jobs"][0]["workflow"].get("extra")
+            metadata = extra.get("fleet") if isinstance(extra, dict) else None
+            name = metadata.get("workflow_name") if isinstance(metadata, dict) else None
+            self._record_batch(body["batch_id"], name)
+            self._save_revision(
+                body,
+                [
+                    row[0]
+                    for row in self.db.execute(
+                        "SELECT id FROM jobs WHERE batch_id=? ORDER BY ordinal", (body["batch_id"],)
+                    )
+                ],
+            )
             self.event(
                 "batch_accepted", detail={"batch_id": body["batch_id"], "count": len(assets)}
             )
@@ -331,7 +740,7 @@ class Ledger:
             + (" WHERE occupied=1" if active_only else "")
             + " ORDER BY priority,created,ordinal"
         )
-        rows = [decode(r) for r in self.db.execute(sql)]
+        rows = [self._decode_job(r) for r in self.db.execute(sql)]
         if not active_only:
             rows.extend(copy.deepcopy(list(self.history.values())))
             rows.sort(key=lambda row: (row["priority"], row["created"], row["ordinal"]))
@@ -339,15 +748,15 @@ class Ledger:
 
     def waiting_jobs(self):
         return [
-            decode(row)
+            self._decode_job(row)
             for row in self.db.execute(
-                "SELECT id,graph,eligible FROM jobs WHERE state='waiting' AND worker_id IS NULL "
+                "SELECT * FROM jobs WHERE state='waiting' AND worker_id IS NULL "
                 "AND occupied=0 AND submit_intent=0 ORDER BY priority,created,ordinal"
             )
         ]
 
     def job(self, job_id):
-        row = decode(
+        row = self._decode_job(
             self.db.execute("SELECT * FROM jobs WHERE id=?", (identity(job_id),)).fetchone()
         )
         if row is not None:
@@ -377,9 +786,10 @@ class Ledger:
             retired = self.db.execute(
                 "SELECT * FROM jobs WHERE occupied=0 AND "
                 "((state IN ('succeeded','failed','cancelled') "
-                "AND collection_state NOT IN ('pending','error')) "
+                "AND collection_state!='pending') "
                 "OR (state='unknown' AND collection_state='unavailable')) ORDER BY ended,created LIMIT 16"
             ).fetchall()
+            retired = [self._decode_job(row) for row in retired]
             for row in retired:
                 count = {"succeeded": "completed", "unknown": "review"}.get(
                     row["state"], row["state"]
@@ -394,11 +804,18 @@ class Ledger:
                 "DELETE FROM batch_progress WHERE batch_id NOT IN (SELECT batch_id FROM jobs)"
             )
             self.db.execute(
+                "DELETE FROM batch_preparation WHERE batch_id NOT IN (SELECT batch_id FROM jobs)"
+            )
+            self.db.execute(
                 "DELETE FROM suspensions WHERE batch_id NOT IN (SELECT batch_id FROM jobs WHERE state='waiting')"
+            )
+            self.db.execute(
+                "DELETE FROM batch_revisions WHERE id NOT IN "
+                "(SELECT revision_id FROM job_snapshots)"
             )
             self.db.execute("DELETE FROM events")
         for row in retired:
-            item = decode(row)
+            item = row
             item.update(assets=[], eligible=[], worker_url=None, retry_of=None)
             item["history"] = {"status": item["history"].get("status")} if item["history"] else None
             self.history[row["id"]] = item
@@ -441,23 +858,13 @@ class Ledger:
             )
         ]
 
-    def release_unknown(self, job_id):
-        with self.db:
-            row = self.job(job_id)
-            if row["state"] != "unknown" or not (row["acknowledged"] or row["observed"]):
-                raise Conflict("Cannot release a submission that may still arrive")
-            self.db.execute(
-                "UPDATE jobs SET occupied=0,collection_state='unavailable' WHERE id=?", (job_id,)
-            )
-            self.event("manual_capacity_release", job_id)
-
     def claim(self, worker):
         with self.db:
             busy = self.db.execute(
                 "SELECT * FROM jobs WHERE worker_id=? AND occupied=1", (worker,)
             ).fetchone()
             if busy:
-                return decode(busy)
+                return self._decode_job(busy)
             w = self.db.execute(
                 "SELECT * FROM workers WHERE id=? AND enabled=1", (worker,)
             ).fetchone()
@@ -473,12 +880,16 @@ class Ledger:
                 (row["batch_id"], row["worker_id"])
                 for row in self.db.execute("SELECT * FROM suspensions")
             }
+            hold = self.db.execute(
+                "SELECT MIN(priority) FROM jobs WHERE batch_id="
+                "(SELECT batch_id FROM batch_edit) AND state='waiting'"
+            ).fetchone()[0]
             for row in self.db.execute(
                 """SELECT r.* FROM jobs r JOIN batches b ON b.id=r.batch_id
-                    WHERE state='waiting' AND b.cancelled=0 AND NOT EXISTS
+                    WHERE state='waiting' AND b.cancelled=0 AND (? IS NULL OR priority<?) AND NOT EXISTS
                     (SELECT 1 FROM suspensions s WHERE s.batch_id=r.batch_id AND s.worker_id=?)
                     ORDER BY priority,created,ordinal""",
-                (worker,),
+                (hold, hold, worker),
             ).fetchall():
                 eligible = set(json.loads(row["eligible"]))
                 preferred = next(
@@ -599,10 +1010,18 @@ class Ledger:
             )
             if not present and (cancel_ack or row["cancel_ack"]):
                 self._terminal(row, "cancelled")
-            elif not present and (row["acknowledged"] or row["observed"]):
+            elif not present:
+                # A reachable node has neither a queue entry nor history for this
+                # identity. Accept losing that job after a restart, without
+                # retrying it or suspending the remaining batch on this node.
+                self._terminal(
+                    row,
+                    "cancelled",
+                    error="Node no longer reports this job; dropped without retry.",
+                )
+            elif row["state"] == "unknown":
                 self.db.execute(
-                    "UPDATE jobs SET state='unknown',error=? WHERE id=?",
-                    ("Worker no longer reports this job; outcome requires reconciliation", job_id),
+                    "UPDATE jobs SET state='outstanding',error=NULL WHERE id=?", (job_id,)
                 )
 
     def cancel_queued(self, batch_id=None, job_ids=None):
@@ -621,6 +1040,26 @@ class Ledger:
                     self._cancel_job(row)
         return {"cancelled": sum(wanted is None or row["id"] in wanted for row in rows)}
 
+    def rename_batch(self, batch_id, name):
+        """Rename queued work without changing its source, prepared jobs, or edit hold."""
+        identity(batch_id)
+        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 200:
+            raise ValueError("Batch name must contain 1–200 characters")
+        name = name.strip()
+        if any(ord(char) < 32 or ord(char) == 127 for char in name):
+            raise ValueError("Batch name must be a single line without control characters")
+        with self.db:
+            changed = self.db.execute(
+                "UPDATE batch_progress SET name=? WHERE batch_id=? AND EXISTS "
+                "(SELECT 1 FROM jobs WHERE batch_id=? AND state='waiting' "
+                "AND worker_id IS NULL AND occupied=0 AND submit_intent=0)",
+                (name, batch_id, batch_id),
+            )
+            if not changed.rowcount:
+                raise Conflict("This batch no longer has queued jobs. Refresh the queue.")
+            self.event("batch_renamed", detail={"batch_id": batch_id, "name": name})
+        return {"batch_id": batch_id, "name": name}
+
     def reorder_batch(self, batch_id, before_batch_id):
         """Move a batch's unassigned jobs; claims and admissions use this same ledger thread."""
         identity(batch_id)
@@ -629,6 +1068,8 @@ class Ledger:
         if batch_id == before_batch_id:
             raise ValueError("A batch cannot be moved before itself")
         with self.db:
+            if self.edit_state():
+                raise Conflict("Queue order is locked while a batch is being edited")
             self.db.execute("BEGIN IMMEDIATE")
             rows = self.db.execute(
                 "SELECT id,batch_id FROM jobs WHERE state='waiting' AND worker_id IS NULL "
@@ -655,6 +1096,9 @@ class Ledger:
         return {"batch_ids": order}
 
     def _cancel_job(self, row):
+        edit = self.edit_state()
+        if edit and row["batch_id"] == edit["batch_id"] and row["state"] == "waiting":
+            raise Conflict("Discard the batch edit before cancelling its queued jobs")
         self.db.execute("UPDATE jobs SET cancel_requested=1 WHERE id=?", (row["id"],))
         if not row["submit_intent"]:
             self._terminal(row, "cancelled")
@@ -700,13 +1144,25 @@ class Ledger:
                 self._cancel_job(row)
         return {"cancelled": True}
 
-    def collected(self, job_id, outputs=None, error=None):
+    def collected(self, job_id, outputs=None, error=None, missing=None):
         with self.db:
+            row = self.db.execute("SELECT diagnostics FROM jobs WHERE id=?", (job_id,)).fetchone()
+            diagnostics = json.loads(row[0]) if row[0] is not None else None
+            if missing:
+                diagnostics = {**(diagnostics or {}), "missing_results": missing}
+            collection_state = "error" if error else "collected"
+            if missing and not error:
+                count, _, preview = output_summary(outputs or {})
+                if not count and preview is None:
+                    collection_state = "unavailable"
+                elif any(ref["type"] != "temp" for ref in missing):
+                    collection_state = "partial"
             self.db.execute(
-                "UPDATE jobs SET outputs=?,collection_state=?,error=CASE WHEN state='succeeded' THEN ? ELSE COALESCE(?,error) END WHERE id=?",
+                "UPDATE jobs SET outputs=?,collection_state=?,diagnostics=?,error=CASE WHEN state='succeeded' THEN ? ELSE COALESCE(?,error) END WHERE id=?",
                 (
                     canonical(outputs) if outputs is not None else None,
-                    "error" if error else "collected",
+                    collection_state,
+                    canonical(diagnostics) if diagnostics is not None else None,
                     error,
                     error,
                     job_id,
@@ -722,9 +1178,9 @@ class Ledger:
             row = self.job(job_id)
             if row is None:
                 raise KeyError(job_id)
-            if action == "collect" and row["history"] and row["collection_state"] == "error":
-                self.db.execute("UPDATE jobs SET collection_state='pending' WHERE id=?", (job_id,))
-            elif action == "front" and row["state"] == "waiting":
+            if action == "front" and row["state"] == "waiting":
+                if self.edit_state():
+                    raise Conflict("Queue order is locked while a batch is being edited")
                 minimum = self.db.execute("SELECT MIN(priority) FROM jobs").fetchone()[0]
                 self.db.execute("UPDATE jobs SET priority=? WHERE id=?", (minimum - 1, job_id))
             elif action == "hide" and row["state"] in TERMINAL:
@@ -754,11 +1210,7 @@ class Ledger:
         for row in jobs:
             del row["priority"]
         counts = {
-            row["batch_id"]: dict(row)
-            for row in self.db.execute(
-                "SELECT p.*,json_array_length(r.job_ids) AS total FROM batch_progress p "
-                "JOIN batch_receipts r USING(batch_id)"
-            )
+            row["batch_id"]: dict(row) for row in self.db.execute("SELECT * FROM batch_progress")
         }
         for row in self.db.execute(
             "SELECT batch_id,state,count(*) AS n FROM jobs GROUP BY batch_id,state"
@@ -772,6 +1224,7 @@ class Ledger:
             if key:
                 counts[row["batch_id"]][key] += row["n"]
         return {
+            "edit": self.edit_state(),
             "paused": self.paused(),
             "workers": self.workers(),
             "jobs": jobs,

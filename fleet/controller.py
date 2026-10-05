@@ -51,51 +51,85 @@ class Controller:
                 if prior["digest"] not in batch_digests(body):
                     raise Conflict("Batch identity already belongs to different settings")
                 return {**prior, "replayed": True}
-            if self.fatal_error:
-                raise Conflict("Fleet storage is unavailable; dispatch and admission are stopped")
-            workers = [w for w in await self.store.call("workers") if w["enabled"]]
-            if not workers:
-                raise ValueError(
-                    "Add and enable a node in Fleet, then click Done before running a workflow"
-                )
-            try:
-                eligible, assets, errors = [], [], {}
-                # Retry failed discovery on the next admission, not for every job.
-                unavailable = set()
-                for job in body["jobs"]:
-                    selected = []
-                    for w in workers:
-                        if w["id"] in unavailable:
-                            continue
-                        try:
-                            missing = await self.remote.compatible(w, job["output"])
-                            if missing:
-                                errors[w["id"]] = "; ".join(missing[:8])
-                            else:
-                                selected.append(w["id"])
-                        except (ValueError, OSError, TimeoutError) as exc:
-                            errors[w["id"]] = str(exc)
-                            unavailable.add(w["id"])
-                        except Exception as exc:
-                            errors[w["id"]] = type(exc).__name__
-                            unavailable.add(w["id"])
-                    if not selected:
-                        raise ValueError("No compatible worker: " + canonical(errors))
-                    eligible.append(selected)
-                    snapshot = asyncio.create_task(
-                        asyncio.to_thread(self.artifacts.snapshot, job["output"])
-                    )
-                    try:
-                        assets.append(await asyncio.shield(snapshot))
-                    except asyncio.CancelledError:
-                        # A thread cannot be cancelled. Keep the lock until it stops
-                        # writing so cleanup cannot miss a late snapshot.
-                        await asyncio.gather(snapshot, return_exceptions=True)
-                        raise
-                answer = await self.store.call("admit", body, assets, eligible)
-                return {**answer, "excluded_workers": errors}
-            finally:
+            return await self._admit_prepared(body)
+
+    async def save_edit(self, body):
+        body = prepared_batch(body)
+        async with self.admission_lock:
+            prior = await self.store.call("edit_receipt", body)
+            if prior:
+                return prior
+            previous = await self.store.call("prepare_edit", body)
+            return await self._admit_prepared(body, previous)
+
+    async def save_details(self, body):
+        # Name-only edits and shrinking require no preparation or available workers.
+        if body.get("jobs"):
+            body = prepared_batch(body)
+        async with self.admission_lock:
+            prior = await self.store.call("edit_receipt", body)
+            if prior:
+                return prior
+            previous = await self.store.call("prepare_details", body)
+            if not body.get("jobs"):
+                result = await self.store.call("commit_details", body, [], [])
                 await self.cleanup_inputs()
+                return result
+            return await self._admit_prepared(
+                body, [previous[-1]] * len(body["jobs"]), "commit_details"
+            )
+
+    async def _admit_prepared(self, body, previous=None, commit=None):
+        if self.fatal_error:
+            raise Conflict("Fleet storage is unavailable; dispatch and admission are stopped")
+        workers = [w for w in await self.store.call("workers") if w["enabled"]]
+        if not workers:
+            raise ValueError(
+                "Add and enable a node in Fleet, then click Done before running a workflow"
+            )
+        try:
+            eligible, assets, errors = [], [], {}
+            # Retry failed discovery on the next admission, not for every job.
+            unavailable = set()
+            for index, job in enumerate(body["jobs"]):
+                selected = []
+                for w in workers:
+                    if w["id"] in unavailable:
+                        continue
+                    try:
+                        missing = await self.remote.compatible(w, job["output"])
+                        if missing:
+                            errors[w["id"]] = "; ".join(missing[:8])
+                        else:
+                            selected.append(w["id"])
+                    except (ValueError, OSError, TimeoutError) as exc:
+                        errors[w["id"]] = str(exc)
+                        unavailable.add(w["id"])
+                    except Exception as exc:
+                        errors[w["id"]] = type(exc).__name__
+                        unavailable.add(w["id"])
+                if not selected:
+                    raise ValueError("No compatible worker: " + canonical(errors))
+                eligible.append(selected)
+                arguments = (
+                    (job["output"],) if previous is None else (job["output"], previous[index])
+                )
+                snapshot = asyncio.create_task(
+                    asyncio.to_thread(self.artifacts.snapshot, *arguments)
+                )
+                try:
+                    assets.append(await asyncio.shield(snapshot))
+                except asyncio.CancelledError:
+                    # A thread cannot be cancelled. Keep the lock until it stops
+                    # writing so cleanup cannot miss a late snapshot.
+                    await asyncio.gather(snapshot, return_exceptions=True)
+                    raise
+            answer = await self.store.call(
+                commit or ("admit" if previous is None else "commit_edit"), body, assets, eligible
+            )
+            return {**answer, "excluded_workers": errors}
+        finally:
+            await self.cleanup_inputs()
 
     async def start(self):
         await self.maintain()
@@ -166,7 +200,7 @@ class Controller:
                             ),
                             name=f"fleet-events-{key}",
                         )
-                # Configuration prevents orphaning active work or collection retries.
+                # Configuration prevents orphaning active work or pending collection.
                 for key in set(self.tasks) - {w["id"] for w in workers}:
                     self.tasks.pop(key).cancel()
                     self.socket_tasks.pop(key).cancel()
@@ -306,7 +340,7 @@ class Controller:
             for row in rows:
                 if row["history"] and row["collection_state"] == "pending":
                     try:
-                        outputs = await self.artifacts.collect(row, self.remote)
+                        result = await self.artifacts.collect(row, self.remote)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -314,8 +348,10 @@ class Controller:
                             "collected", row["id"], None, type(exc).__name__ + ": " + str(exc)[:300]
                         )
                     else:
-                        await self.store.call("collected", row["id"], outputs)
-                        del outputs
+                        await self.store.call(
+                            "collected", row["id"], result.outputs, None, result.missing
+                        )
+                        del result
                 del row
             if not rows:
                 await asyncio.sleep(0.5)
@@ -384,22 +420,16 @@ class Controller:
         return await self.store.call("active_identity", worker, remote_id)
 
     async def release_unknown(self, job_id):
+        # Older browser sessions can still request a check. Missing jobs now
+        # release capacity automatically through the ordinary observation path.
         row = await self.store.call("job", job_id)
-        if row is None or row["state"] != "unknown":
-            raise Conflict("Only unknown outcomes can be manually reconciled")
+        if row is None:
+            raise Conflict("This job is no longer available")
+        if row["state"] != "unknown" or not row["occupied"]:
+            return {"resolved": row["state"]}
         await self.observe(row)
         row = await self.store.call("job", job_id)
-        if row["state"] != "unknown":
-            return {"resolved": row["state"]}
-        queue = await self.remote.get(row["worker_url"], "/queue")
-        if any(
-            item[1] == row["remote_id"]
-            for k in ("queue_running", "queue_pending")
-            for item in queue[k]
-        ):
-            raise Conflict("The exact job is still queued or executing")
-        await self.store.call("release_unknown", job_id)
-        return {"released": True, "outcome": "unknown"}
+        return {"resolved": row["state"]}
 
     async def on_event(self, worker, kind, data):
         if kind not in EXECUTION_EVENTS or not isinstance(data, dict):
