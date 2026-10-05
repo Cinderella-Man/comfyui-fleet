@@ -60,6 +60,10 @@ export class BatchEditor {
 
   get marker() { return this.app.rootGraph.extra?.fleet_edit_id; }
   get active() { return Boolean(this.session && this.marker === this.session.id); }
+  get runBlockedReason() {
+    if (this.opening) return "Wait for Fleet to finish opening the batch editor.";
+    return this.marker || this.busy ? "Use Save to batch or Discard changes for this workflow." : null;
+  }
   draft() { return this.details ? this.details.value : captureSource(this.app); }
   credentials() { return { edit_id: this.session.id, token: this.session.token }; }
 
@@ -78,12 +82,12 @@ export class BatchEditor {
   }
 
   guardRunButtons() {
-    const blocked = Boolean(this.marker);
+    const blocked = this.runBlockedReason;
     for (const button of document.querySelectorAll('[data-testid="queue-button"], .comfy-queue-btn')) {
       if (blocked) {
         if (!this.runButtons.has(button)) this.runButtons.set(button, { disabled: button.disabled, title: button.title });
         button.disabled = true;
-        button.title = "Use Save to batch or Discard changes";
+        button.title = blocked;
       }
     }
     if (!blocked) {
@@ -115,6 +119,7 @@ export class BatchEditor {
     if (this.busy || this.opening || this.closing || this.isPreparing()) throw new Error("Wait for the current preparation to finish");
     this.opening = true;
     try {
+      this.render();
       await this.persist();
       const session = await this.post("/fleet/edit/begin", { batch_id: batchId, owner: this.owner, kind });
       if (!this.marker) this.returnWorkflow = this.app.extensionManager.workflow.activeWorkflow;
@@ -130,7 +135,7 @@ export class BatchEditor {
           () => this.discard().catch(error => this.fail(error)));
       } else await this.loadDraft(session.draft);
       await this.refresh();
-    } finally { this.opening = false; }
+    } finally { this.opening = false; this.render(); }
   }
 
   async loadDraft(source) {

@@ -32,7 +32,7 @@ main{width:320px;height:100vh}aside{position:fixed;left:350px;top:20px}
 </style></head><body><main><div class="sidebar-content-container"><div id="fleet-mount"></div></div></main><aside>
 <label>Workflow <input id="workflow" value="Portraits.json"></label>
 <label>Jobs <input id="count" type="number" value="4"></label>
-<button id="run">Run</button></aside><section id="notifications" aria-label="Notifications"></section><script type="module">
+<button id="run" data-testid="queue-button">Run</button></aside><section id="notifications" aria-label="Notifications"></section><script type="module">
 import {app} from '/scripts/app.js';
 import '/extensions/ComfyUI-Fleet/fleet.js';
 document.querySelector('#run').onclick=async()=>{

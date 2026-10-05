@@ -159,8 +159,8 @@ app.registerExtension({
 
     async function prepare(args) {
       state.waitingActions--;
-      if (editor.marker || editor.busy) {
-        message("Use Save to batch or Discard changes for this workflow.", true);
+      if (editor.runBlockedReason) {
+        message(editor.runBlockedReason, true);
         return false;
       }
       if (args[0] === -1 && state.server?.edit) {
@@ -227,8 +227,8 @@ app.registerExtension({
 
     function queue(...args) {
       if (disposed) return original.queue.apply(this, args);
-      if (editor.marker || editor.busy) {
-        message("Use Save to batch or Discard changes for this workflow.", true);
+      if (editor.runBlockedReason) {
+        message(editor.runBlockedReason, true);
         return Promise.resolve(false);
       }
       state.waitingActions++;

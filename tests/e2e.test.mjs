@@ -1437,6 +1437,57 @@ async function openBatchEditor(page, id, label="Edit workflow") {
   await page.getByRole("button",{name:"Save to batch",exact:true}).waitFor();
 }
 
+for (const outcome of ['opens','fails']) test(`Run is blocked while the batch editor ${outcome} and resumes afterwards`,{timeout:30000},async t=>{
+  const {page,submit,state,until}=await setup(t);
+  await page.evaluate(async()=>{(await import('/scripts/app.js')).app.rootGraph.extra.prompt='OLD-BATCH'});
+  const batch=await submit('Old batch',5);
+  await until(s=>s.jobs.filter(j=>j.acknowledged).length===2);
+  await page.evaluate(async()=>{
+    const {app}=await import('/scripts/app.js');
+    app.rootGraph.extra.prompt='CURRENT-UNSAVED';
+    const original=app.graphToPrompt;
+    window.preparations=0;
+    app.graphToPrompt=async(...args)=>{window.preparations++;return original.apply(app,args)};
+  });
+  let release,received;
+  const delivery=new Promise(resolve=>{release=resolve}),seen=new Promise(resolve=>{received=resolve});
+  t.after(()=>release());
+  await page.route('**/fleet/edit/begin',async route=>{
+    const response=outcome==='opens'?await route.fetch():null;
+    received();await delivery;
+    if(response)await route.fulfill({response});
+    else await route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Edit opening failed'})});
+  },{times:1});
+  const row=page.locator(`[data-batch-id="${batch.batch_id}"]`);
+  await row.locator('summary').click();
+  await row.getByRole('button',{name:'Edit workflow',exact:true}).click();
+  await seen;
+
+  // The canvas is still the user's current workflow while the edit response is
+  // pending. Keyboard/API Run must not start preparation that can race its load.
+  assert.equal(await page.evaluate(async()=>(await import('/scripts/app.js')).app.queuePrompt(0,1)),false);
+  const run=page.getByRole('button',{name:'Run',exact:true});
+  assert.equal(await run.isDisabled(),true);
+  assert.equal(await page.evaluate(()=>window.preparations),0);
+  assert.equal((await state()).jobs.length,5);
+  assert.equal(await page.evaluate(async()=>(await import('/scripts/app.js')).app.rootGraph.extra.prompt),'CURRENT-UNSAVED');
+
+  release();
+  if(outcome==='opens') {
+    await page.getByRole('button',{name:'Discard changes',exact:true}).waitFor();
+    assert.equal(await run.isDisabled(),true);
+    await page.getByRole('button',{name:'Discard changes',exact:true}).click();
+    await until(s=>!s.edit);
+  } else await page.getByText('Edit opening failed',{exact:true}).waitFor();
+  await page.waitForFunction(()=>!document.querySelector('#run').disabled);
+  assert.equal(await page.evaluate(async()=>(await import('/scripts/app.js')).app.rootGraph.extra.prompt),'CURRENT-UNSAVED');
+  const submitted=await submit('Current work',1);
+  const detail=await (await page.request.get(new URL(`/fleet/jobs/${submitted.job_ids[0]}`,page.url()).href)).json();
+  assert.equal(detail.workflow.prompt['1'].inputs.filename_prefix,'CURRENT-UNSAVED');
+  assert.equal(detail.workflow.extra_data.extra_pnginfo.workflow.extra.fleet_edit_id,undefined);
+  assert.equal(await page.evaluate(()=>window.preparations),1);
+});
+
 test("editing restores authored source, autosaves across reload, and atomically replaces remaining jobs",{timeout:45000},async t=>{
   const {page,submit,state,until,post}=await setup(t);
   await page.evaluate(async()=>{
