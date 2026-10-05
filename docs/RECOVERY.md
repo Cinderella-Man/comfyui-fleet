@@ -60,7 +60,8 @@ cancelled when the updated controller starts.
 | --- | --- |
 | Worker cannot be reached | Check its address, port and network access from the controller. See [installation](INSTALL.md#connect-your-workers). |
 | Job failed | Fix the workflow or worker, then use **Re-enable batch** to let that worker take remaining jobs from the batch. Use **Run** to submit the failed job again if needed. |
-| Results could not be saved | Fix connectivity or storage, then choose **Retry saving results**. This downloads results without executing the workflow again. |
+| Results could not be saved | Fleet reports the error, closes the job and continues the queue. The error remains in session history. There are no result recovery actions or retries. |
+| Result file is missing (HTTP 404/410) | Fleet skips missing files and saves available results. If no results remain, the history entry is cancelled. No operator action is required. |
 | Job says **Checking job** | Fleet checks it automatically. Restore the node's connectivity if it is offline; a job missing from its queue and history will be dropped so queued work can continue. |
 | Queue held for editing | Open the batch’s ⋯ menu, choose **Resume editing**, then Save or Discard. Closing a browser does not release this hold. |
 | Storage error stops scheduling | Check disk space and permissions, then restart with the same state directory. Do not delete the database to clear the error. |

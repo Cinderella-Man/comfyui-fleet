@@ -54,11 +54,11 @@ app.registerExtension({
       return answer;
     }
     const panel = new FleetPanel({
-      notify: text => {
+      notify: (text, severity = "success") => {
         if (disposed) return true;
         const toast = app.extensionManager.toast;
         if (typeof toast?.add !== "function") return false;
-        toast.add({ severity: "success", summary: "Fleet", detail: text, life: 5000, closable: true });
+        toast.add({ severity, summary: "Fleet", detail: text, life: 5000, closable: true });
         return true;
       },
       select,

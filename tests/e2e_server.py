@@ -104,6 +104,9 @@ class Worker:
         self.pending = {"native-job": {}}
         self.history = {}
         self.cancelled = []
+        self.submissions = []
+        self.downloads = []
+        self.download_status = {}
         self.sockets = set()
         self.allow_cancel = asyncio.Event()
         self.allow_cancel.set()
@@ -123,12 +126,17 @@ class Worker:
             answer = {"SaveImage": {"input": {"required": {}}}}
         elif path == "/prompt":
             data = await request.json()
+            self.submissions.append(data["prompt_id"])
             self.pending[data["prompt_id"]] = data
             answer = {"prompt_id": data["prompt_id"]}
         elif path == "/queue":
             answer = {"queue_running": [[0, key] for key in self.pending], "queue_pending": []}
         elif path == "/view":
-            return web.Response(body=IMAGE, content_type="image/png")
+            status = self.download_status.get(request.query["filename"], 200)
+            self.downloads.append({**request.query, "status": status})
+            return web.Response(
+                status=status, body=IMAGE if status == 200 else b"", content_type="image/png"
+            )
         elif path == "/history":
             if request.method == "POST" and (await request.json()).get("clear"):
                 self.history.clear()
@@ -164,7 +172,7 @@ class Worker:
             else:
                 await socket.send_json(event)
 
-    def complete(self, key, with_results=False):
+    def complete(self, key, with_results=False, outputs=None):
         if key == "native-job" or key not in self.pending:
             raise web.HTTPConflict(text="No such active Fleet prompt")
         self.pending.pop(key)
@@ -174,7 +182,9 @@ class Worker:
                 "completed": True,
                 "messages": [["execution_success", {}]],
             },
-            "outputs": {"1": {"images": [{"filename": "result.png", "type": "output"}]}}
+            "outputs": outputs
+            if outputs is not None
+            else {"1": {"images": [{"filename": "result.png", "type": "output"}]}}
             if with_results
             else {},
         }
@@ -262,8 +272,9 @@ async def main(root, node_count):
                             else worker.allow_cancel.clear
                         )()
                 if "complete" in data:
+                    workers[data["worker"]].download_status.update(data.get("download_status", {}))
                     workers[data["worker"]].complete(
-                        data["complete"], data.get("with_results", False)
+                        data["complete"], data.get("with_results", False), data.get("outputs")
                     )
                 if data.get("restart"):
                     await control.stop()
@@ -293,6 +304,14 @@ async def main(root, node_count):
                 }
             return web.json_response(counts)
 
+        async def worker_requests(request):
+            return web.json_response(
+                {
+                    name: {"submissions": worker.submissions, "downloads": worker.downloads}
+                    for name, worker in workers.items()
+                }
+            )
+
         async def view(request):
             path = str(Path(request.query.get("subfolder", "")) / request.query["filename"])
             return web.Response(body=read_regular(roots["output"], path), content_type="image/png")
@@ -310,6 +329,7 @@ async def main(root, node_count):
         app.router.add_get("/scripts/{name}", native)
         app.router.add_route("*", "/fixture", fixture)
         app.router.add_get("/fixture/storage", storage)
+        app.router.add_get("/fixture/requests", worker_requests)
         app.router.add_get("/view", view)
         app.router.add_post("/history", history)
         app.router.add_post("/api/history", history)

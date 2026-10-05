@@ -14,10 +14,135 @@ from fleet.artifacts import Artifacts
 from fleet.controller import Controller
 import fleet.controller as controller_module
 from fleet.http import Routes
-from fleet.store import Store
+from fleet.jobs import job as native_job
+from fleet.store import Conflict, Store
 from fleet.worker import Remote, hardware_info, redirect_guard
 import fleet.worker as worker_module
 from test_ledger import batch, history
+
+
+@pytest.mark.parametrize("preview_node", ["10", "66"])
+@pytest.mark.parametrize(
+    "missing_type,http_status,with_final,execution_ok,expected",
+    [
+        ("temp", 404, True, True, "collected"),
+        ("temp", 404, False, True, "unavailable"),
+        ("temp", 404, False, False, "unavailable"),
+        ("output", 404, True, True, "partial"),
+        ("output", 404, False, True, "unavailable"),
+        ("input", 404, True, True, "partial"),
+        ("output", 410, True, True, "partial"),
+        ("temp", 500, True, True, "error"),
+    ],
+)
+def test_collection_errors_finish_without_recovery(
+    tmp_path, preview_node, missing_type, http_status, with_final, execution_ok, expected
+):
+    async def scenario():
+        requests = []
+
+        async def view(request):
+            ref = dict(request.query)
+            requests.append(ref)
+            if ref["filename"] == "missing.png":
+                return web.Response(status=http_status)
+            return web.Response(body=b"final image")
+
+        app = web.Application()
+        app.router.add_get("/view", view)
+        runner, url = await server(app)
+        store = Store(tmp_path / "state")
+        await store.open()
+        roots = {kind: tmp_path / kind for kind in ("input", "output", "temp")}
+        for path in roots.values():
+            path.mkdir()
+        artifacts = Artifacts(tmp_path / "state", roots)
+        task = None
+        try:
+            await store.call("configure", [{"id": "one", "url": url}])
+            await store.call("admit", batch(1), [[]], [["one"]])
+            row = await store.call("claim", "one")
+            await store.call("begin_submit", row["id"])
+            await store.call("submitted", row["id"], 200, {"prompt_id": row["remote_id"]})
+            reported = history(execution_ok)
+            reported["outputs"] = {
+                preview_node: {"images": [{"filename": "missing.png", "type": missing_type}]}
+            }
+            if with_final:
+                reported["outputs"]["12"] = {
+                    "images": [{"filename": "final.png", "type": "output"}],
+                    "text": ["keep metadata"],
+                }
+            await store.call("finish", row["id"], reported)
+            async with aiohttp.ClientSession() as session:
+                control = Controller(store, Remote(session), artifacts, lambda event: None)
+                task = asyncio.create_task(control.collection_loop())
+
+                async def finished():
+                    return (await store.call("job", row["id"]))["collection_state"] != "pending"
+
+                await until(finished)
+                saved = await store.call("job", row["id"])
+                assert saved["collection_state"] == expected, saved["error"]
+                assert saved["history"] == reported
+                assert saved["state"] == ("succeeded" if execution_ok else "failed")
+                if expected != "error":
+                    assert saved["outputs"][preview_node]["images"] == []
+                    missing = saved["diagnostics"]["missing_results"]
+                    assert len(missing) == 1
+                    assert missing[0]["filename"] == "missing.png"
+                    assert missing[0]["type"] == missing_type
+                    if with_final:
+                        ref = saved["outputs"]["12"]["images"][0]
+                        assert ref["filename"] == (
+                            "0002-final.png" if preview_node == "10" else "0001-final.png"
+                        )
+                        assert ref["type"] == "output"
+                        assert (
+                            roots["output"] / ref["subfolder"] / ref["filename"]
+                        ).read_bytes() == b"final image"
+                        assert saved["outputs"]["12"]["text"] == ["keep metadata"]
+                    if execution_ok:
+                        assert saved["error"] is None
+                    assert native_job(saved)["status"] == (
+                        "failed"
+                        if not execution_ok
+                        else "cancelled"
+                        if expected == "unavailable"
+                        else "completed"
+                    )
+                    with pytest.raises(Conflict):
+                        await store.call("action", row["id"], "collect")
+                    # No retained recovery blocks node removal or finished-job cleanup.
+                    assert await store.call("configure", []) == []
+                    await store.call("prune")
+                    assert (await store.call("job", row["id"]))["outputs"] == saved["outputs"]
+                    assert (await store.call("job", row["id"]))["diagnostics"] == saved[
+                        "diagnostics"
+                    ]
+                    assert await store.call("pending_collection") == []
+                else:
+                    assert "missing.png" in saved["error"]
+                    assert f"HTTP {http_status}" in saved["error"]
+                    with pytest.raises(Conflict):
+                        await store.call("action", row["id"], "collect")
+                    assert await store.call("pending_collection") == []
+                    assert await store.call("configure", []) == []
+                    await store.call("prune")
+                    assert (await store.call("job", row["id"]))["error"] == saved["error"]
+                assert (
+                    next(ref for ref in requests if ref["filename"] == "missing.png")["type"]
+                    == missing_type
+                )
+                assert sum(ref["filename"] == "missing.png" for ref in requests) == 1
+        finally:
+            if task:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await store.close()
+            await runner.cleanup()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("receipt", ["acknowledged", "observed", "unconfirmed", "interrupted"])

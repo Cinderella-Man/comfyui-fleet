@@ -294,7 +294,7 @@ def test_retention_keeps_batch_counts_and_receipts_without_finished_job_records(
         restored.close()
 
 
-def test_retention_preserves_collection_retry_and_uncertain_submission(ledger):
+def test_retention_retires_collection_errors_but_preserves_uncertain_submission(ledger):
     admit(ledger, batch(3))
     a, b = ledger.claim("a"), ledger.claim("b")
     ledger.begin_submit(a["id"])
@@ -303,11 +303,12 @@ def test_retention_preserves_collection_retry_and_uncertain_submission(ledger):
     ledger.begin_submit(b["id"])
     ledger.submitted(b["id"], None, {})
     ledger.prune()
-    assert ledger.db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 3
-    with pytest.raises(Conflict, match="results to collect"):
-        ledger.configure([{"id": "b", "url": "http://127.0.0.2:8188"}])
-    ledger.action(a["id"], "collect")
-    assert ledger.pending_collection()[0]["id"] == a["id"]
+    assert ledger.db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 2
+    ledger.configure([{"id": "b", "url": "http://127.0.0.2:8188"}])
+    with pytest.raises(Conflict):
+        ledger.action(a["id"], "collect")
+    assert ledger.pending_collection() == []
+    assert ledger.job(a["id"])["error"] == "download failed"
     assert ledger.claim("b")["id"] == b["id"]
     assert not ledger.begin_submit(b["id"])
 
@@ -629,7 +630,7 @@ def test_unchecked_submission_stays_reserved_and_configuration_cannot_orphan_it(
         ledger.configure([])
 
 
-def test_collection_retry_is_not_execution_and_old_jobs_cannot_be_resubmitted(ledger):
+def test_failed_collection_cannot_be_retried_or_resubmitted(ledger):
     admit(ledger, batch(1))
     a = ledger.claim("a")
     ledger.begin_submit(a["id"])
@@ -638,9 +639,10 @@ def test_collection_retry_is_not_execution_and_old_jobs_cannot_be_resubmitted(le
         ledger.action(a["id"], "retry")
     assert ledger.job(a["id"])["state"] == "failed"
     ledger.collected(a["id"], None, "download failed")
-    ledger.action(a["id"], "collect")
+    with pytest.raises(Conflict):
+        ledger.action(a["id"], "collect")
     assert len(ledger.jobs()) == 1
-    assert ledger.job(a["id"])["collection_state"] == "pending"
+    assert ledger.job(a["id"])["collection_state"] == "error"
 
 
 def test_single_owner_node_backup_and_existing_restore_pause(tmp_path):
@@ -715,13 +717,11 @@ def test_observed_submission_clears_uncertainty_then_drops_if_it_disappears(ledg
     assert ledger.job(row["id"])["collection_state"] == "not_applicable"
 
 
-def test_successful_collection_retry_clears_transfer_error_only(ledger):
+def test_successful_collection_finishes_without_recovery(ledger):
     admit(ledger, batch(1))
     row = ledger.claim("a")
     ledger.begin_submit(row["id"])
     ledger.finish(row["id"], history())
-    ledger.collected(row["id"], None, "temporary download failure")
-    ledger.action(row["id"], "collect")
     ledger.collected(row["id"], {"99": {"images": []}})
     final = ledger.job(row["id"])
     assert final["state"] == "succeeded" and final["error"] is None

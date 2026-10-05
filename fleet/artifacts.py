@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -12,6 +13,13 @@ import uuid
 
 from .store import owned_directory
 from .validation import MAX_FILE, file_reference, identity
+from .worker import ResultDownloadError
+
+
+@dataclass
+class Collection:
+    outputs: dict
+    missing: list
 
 
 def open_regular(root, relative):
@@ -205,20 +213,31 @@ class Artifacts:
         layout, destination = await asyncio.to_thread(self.collection_directory, row)
         subfolder = destination.relative_to(self.roots["output"]).as_posix()
         counter = 0
-        for node in output.values():
+        missing = []
+        for node_id, node in output.items():
             if not isinstance(node, dict):
                 continue
             for media, entries in node.items():
                 if not isinstance(entries, list):
                     continue
-                for index, ref in enumerate(entries):
+                collected = []
+                for ref in entries:
                     if not isinstance(ref, dict) or "filename" not in ref:
+                        collected.append(ref)
                         continue
                     counter += 1
                     if counter > 8192:
                         raise ValueError("Output manifest exceeds 8192 reported files")
                     safe = file_reference(ref)
-                    data = await remote.download(row["worker_url"], safe)
+                    try:
+                        data = await remote.download(row["worker_url"], safe)
+                    except ResultDownloadError as exc:
+                        if exc.status not in (404, 410):
+                            raise
+                        # A stale file reference cannot be repaired by downloading
+                        # it again. Record the loss and collect everything else.
+                        missing.append({"node_id": node_id, "media": media, **safe})
+                        continue
                     # Shared folders also need the job identity: every worker can
                     # independently report the same filename and counter.
                     prefix = (row["id"] + "-") if layout != "job" else ""
@@ -228,12 +247,10 @@ class Artifacts:
                         name = f"{prefix}{hashlib.sha256(data).hexdigest()}{Path(safe['filename']).suffix[:12]}"
                     await asyncio.to_thread(publish, destination, name, data)
                     del data
-                    entries[index] = {
-                        **ref,
-                        "filename": name,
-                        "subfolder": subfolder,
-                        "type": "output",
-                    }
+                    collected.append(
+                        {**ref, "filename": name, "subfolder": subfolder, "type": "output"}
+                    )
+                node[media] = collected
         manifest = {"job_id": row["id"], "remote_id": row["remote_id"], "outputs": output}
         data = json.dumps(manifest, indent=2).encode()
         previous = None
@@ -248,5 +265,5 @@ class Artifacts:
         if previous is not None and previous not in (data, json.dumps(legacy, indent=2).encode()):
             raise ValueError("Existing artifact differs; refusing to overwrite it")
         # New results need no extra history file: publication is already atomic and
-        # collection retries retain their remote references in the ledger.
-        return output
+        # unfinished collection retains its remote references across restarts.
+        return Collection(output, missing)

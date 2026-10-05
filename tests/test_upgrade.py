@@ -15,6 +15,33 @@ from fleet.validation import canonical
 from test_ledger import batch, history
 
 
+@pytest.mark.parametrize(
+    "error", ["ValueError: Result download failed: HTTP 404", "OSError: offline"]
+)
+def test_old_collection_errors_finish_without_recovery_after_restart(tmp_path, error):
+    root = tmp_path / "state"
+    store = Ledger(root)
+    try:
+        store.configure([{"id": "one", "url": "http://127.0.0.1:8188"}])
+        store.admit(batch(2), [[], []], [["one"], ["one"]])
+        row = store.claim("one")
+        store.begin_submit(row["id"])
+        store.finish(row["id"], history())
+        store.collected(row["id"], None, error)
+        store.close()
+        store = Ledger(root)
+        assert store.pending_collection() == []
+        assert store.job(row["id"])["error"] == error
+        assert store.claim("one")["id"] != row["id"]
+        with pytest.raises(Conflict):
+            store.action(row["id"], "collect")
+        store.prune()
+        assert store.job(row["id"])["error"] == error
+        assert store.db.execute("SELECT 1 FROM jobs WHERE id=?", (row["id"],)).fetchone() is None
+    finally:
+        store.close()
+
+
 def test_previously_released_jobs_become_cancelled_without_releasing_unchecked_work(tmp_path):
     root = tmp_path / "state"
     store = Ledger(root)

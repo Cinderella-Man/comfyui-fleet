@@ -200,7 +200,7 @@ class Controller:
                             ),
                             name=f"fleet-events-{key}",
                         )
-                # Configuration prevents orphaning active work or collection retries.
+                # Configuration prevents orphaning active work or pending collection.
                 for key in set(self.tasks) - {w["id"] for w in workers}:
                     self.tasks.pop(key).cancel()
                     self.socket_tasks.pop(key).cancel()
@@ -340,7 +340,7 @@ class Controller:
             for row in rows:
                 if row["history"] and row["collection_state"] == "pending":
                     try:
-                        outputs = await self.artifacts.collect(row, self.remote)
+                        result = await self.artifacts.collect(row, self.remote)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -348,8 +348,10 @@ class Controller:
                             "collected", row["id"], None, type(exc).__name__ + ": " + str(exc)[:300]
                         )
                     else:
-                        await self.store.call("collected", row["id"], outputs)
-                        del outputs
+                        await self.store.call(
+                            "collected", row["id"], result.outputs, None, result.missing
+                        )
+                        del result
                 del row
             if not rows:
                 await asyncio.sleep(0.5)

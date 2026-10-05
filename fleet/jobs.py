@@ -63,7 +63,9 @@ def job(row, detail=False):
     if state == "unknown" and not row["occupied"]:
         status = "failed"  # Native UI has no unknown status; Fleet retains the exact distinction.
     if state == "succeeded" and row["collection_state"] != "collected":
-        status = "failed" if row["collection_state"] == "error" else "in_progress"
+        status = {"error": "failed", "partial": "completed", "unavailable": "cancelled"}.get(
+            row["collection_state"], "in_progress"
+        )
     result = {
         "id": row["id"],
         "status": status,
@@ -82,6 +84,10 @@ def job(row, detail=False):
             "collection_state": row["collection_state"],
             "error": row["error"],
             "diagnostics": row["diagnostics"],
+            "collection_note": {
+                "partial": "Some result files were unavailable. Available results were saved.",
+                "unavailable": "Result files were unavailable. This job was closed automatically.",
+            }.get(row["collection_state"]),
         },
     }
     if detail:

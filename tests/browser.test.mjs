@@ -497,7 +497,7 @@ test("a failed Cancel active jobs request leaves work intact and can be retried"
   assert.deepEqual((await state()).jobs[1],original[1]);
 });
 
-test("job recovery remains visible only when needed, without routine details or IDs", {timeout:30000}, async t=>{
+test("result errors are reported once without recovery controls or lingering activity", {timeout:30000}, async t=>{
   const workers = [{id:"node-1",url:"http://192.168.1.20:8188",enabled:true}];
   const unknown = fixtureJob(0,{state:"unknown",worker_id:"node-1",occupied:1,submit_intent:1,error:"Connection lost; outcome unknown."});
   const collecting = fixtureJob(1,{state:"succeeded",worker_id:"node-1",collection_state:"error",error:"Could not save the output."});
@@ -506,18 +506,26 @@ test("job recovery remains visible only when needed, without routine details or 
   await region.getByText("Checking job",{exact:true}).waitFor();
   assert.equal(await region.getByText("Fleet is checking this job. If the node no longer has it, it will be dropped and queued work will continue.",{exact:true}).isVisible(),true);
   assert.equal(await region.getByText("Connection lost; outcome unknown.",{exact:true}).count(),0);
-  assert.equal(await region.getByText("Could not save the output.",{exact:true}).isVisible(),true);
+  await page.getByText(/Could not save the output\. The job is closed\./).waitFor();
+  assert.equal(await region.locator(`[data-job-id="${collecting.id}"]`).count(),0);
   assert.equal(await region.locator("details").count(),0);
   assert.equal(await region.getByText(/Job ID:|Batch ID:|Assigned by Fleet/).count(),0);
   assert.equal(await region.getByRole("button",{name:"View progress",exact:true}).count(),0);
   assert.equal(await region.locator(`[data-job-id="${unknown.id}"]`).getByRole("button",{name:"Cancel job",exact:true}).isEnabled(),true);
   assert.equal(await region.locator(`[data-job-id="${collecting.id}"]`).getByRole("button",{name:"Cancel job",exact:true}).count(),0,"A completed job waiting for recovery cannot be cancelled");
   assert.equal(await region.getByRole("button",{name:"Verify inactivity and release worker",exact:true}).count(),0);
-  const collect = page.waitForResponse(response=>response.url().endsWith(`/fleet/jobs/${collecting.id}/collect`));
-  await region.getByRole("button",{name:"Retry saving results",exact:true}).click();await collect;
-  assert.deepEqual(jobActions(),[{id:collecting.id,action:"collect"}]);
-  updateJobs([{...unknown,state:"cancelled",occupied:0,collection_state:"not_applicable"},collecting]);
+  assert.equal(await page.getByRole("button",{name:"Retry saving results",exact:true}).count(),0);
+  await page.getByRole("button",{name:"Dismiss notification",exact:true}).click();
+  await page.waitForTimeout(300);
+  assert.equal(await page.locator(".fleet-notification").isVisible(),false);
+  assert.deepEqual(jobActions(),[]);
+  updateJobs([{...unknown,state:"cancelled",occupied:0,collection_state:"not_applicable"},
+    {...collecting,collection_state:"partial",error:null},
+    fixtureJob(2,{state:"succeeded",worker_id:"node-1",collection_state:"unavailable"})]);
   await region.locator(`[data-job-id="${unknown.id}"]`).waitFor({state:"hidden"});
+  await region.locator(`[data-job-id="${collecting.id}"]`).waitFor({state:"hidden"});
+  assert.equal(await region.getByRole("button",{name:"Retry saving results",exact:true}).count(),0);
+  assert.equal(await region.getByText("Results need attention",{exact:true}).count(),0);
   assert.equal(await region.getByText("Needs review",{exact:true}).count(),0);
 });
 

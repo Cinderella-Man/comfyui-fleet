@@ -116,8 +116,16 @@ environment and restart while Fleet is idle:
 | `batch` | `fleet/batch-<batch-id>/<job-id>-0001-original.png` |
 | `flat` | `fleet/<job-id>-0001-original.png` |
 
-Changing the setting leaves existing files in place. A retried download uses
-the layout it started with. Original files also remain on the workers.
+Changing the setting leaves existing files in place. Collection interrupted by
+a controller restart resumes in its original layout. Original files also remain
+on the workers.
+
+Files that have disappeared from a worker are skipped so Fleet can still save
+available results. Missing final outputs and download errors produce a brief
+notification and a finished history entry, with no recovery controls. If no
+results remain, the history entry is cancelled. Fleet never retries result
+collection or reruns a workflow to recover results, and result errors do not
+hold the queue or prevent removing a node.
 
 ## Limits
 

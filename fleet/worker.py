@@ -53,6 +53,18 @@ def hardware_info(stats):
     return {"devices": devices, "ram_total": memory(stats["system"].get("ram_total"))}
 
 
+class ResultDownloadError(ValueError):
+    def __init__(self, status, ref):
+        self.status = status
+        path = "/".join(part for part in (ref.get("subfolder"), ref["filename"]) if part)
+        location = f"{ref.get('type', 'output')}/{path}"
+        if status == 404:
+            message = "Result file is missing on the node (HTTP 404). File: " + location
+        else:
+            message = f"Result download failed: HTTP {status}. File: {location}"
+        super().__init__(message)
+
+
 class Remote:
     def __init__(self, session):
         self.session = session
@@ -142,7 +154,7 @@ class Remote:
             worker_url(url) + "/view", params=ref, allow_redirects=False
         ) as response:
             if response.status != 200:
-                raise ValueError(f"Result download failed: HTTP {response.status}")
+                raise ResultDownloadError(response.status, ref)
             return await read_limited(response.content, MAX_FILE)
 
     async def events(self, url, client_id, on_event):

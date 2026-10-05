@@ -16,6 +16,7 @@ import sqlite3
 import time
 import uuid
 
+from .jobs import output_summary
 from .snapshots import difference, reconstruct
 from .validation import (
     TERMINAL,
@@ -595,12 +596,12 @@ class Ledger:
             for key in changed:
                 if self.db.execute(
                     "SELECT 1 FROM jobs WHERE worker_id=? AND (occupied=1 "
-                    "OR (history IS NOT NULL AND collection_state IN ('pending','error')))",
+                    "OR (history IS NOT NULL AND collection_state='pending'))",
                     (key,),
                 ).fetchone():
                     raise Conflict(
                         f"“{key}” still has an active job or results to collect. "
-                        "Let it finish, cancel its job, or resolve its recovery warning first. "
+                        "Let it finish or cancel its job first. "
                         "You can disable the node to stop new assignments."
                     )
             for row in self.db.execute("SELECT id,eligible FROM jobs WHERE state='waiting'"):
@@ -785,7 +786,7 @@ class Ledger:
             retired = self.db.execute(
                 "SELECT * FROM jobs WHERE occupied=0 AND "
                 "((state IN ('succeeded','failed','cancelled') "
-                "AND collection_state NOT IN ('pending','error')) "
+                "AND collection_state!='pending') "
                 "OR (state='unknown' AND collection_state='unavailable')) ORDER BY ended,created LIMIT 16"
             ).fetchall()
             retired = [self._decode_job(row) for row in retired]
@@ -1143,13 +1144,25 @@ class Ledger:
                 self._cancel_job(row)
         return {"cancelled": True}
 
-    def collected(self, job_id, outputs=None, error=None):
+    def collected(self, job_id, outputs=None, error=None, missing=None):
         with self.db:
+            row = self.db.execute("SELECT diagnostics FROM jobs WHERE id=?", (job_id,)).fetchone()
+            diagnostics = json.loads(row[0]) if row[0] is not None else None
+            if missing:
+                diagnostics = {**(diagnostics or {}), "missing_results": missing}
+            collection_state = "error" if error else "collected"
+            if missing and not error:
+                count, _, preview = output_summary(outputs or {})
+                if not count and preview is None:
+                    collection_state = "unavailable"
+                elif any(ref["type"] != "temp" for ref in missing):
+                    collection_state = "partial"
             self.db.execute(
-                "UPDATE jobs SET outputs=?,collection_state=?,error=CASE WHEN state='succeeded' THEN ? ELSE COALESCE(?,error) END WHERE id=?",
+                "UPDATE jobs SET outputs=?,collection_state=?,diagnostics=?,error=CASE WHEN state='succeeded' THEN ? ELSE COALESCE(?,error) END WHERE id=?",
                 (
                     canonical(outputs) if outputs is not None else None,
-                    "error" if error else "collected",
+                    collection_state,
+                    canonical(diagnostics) if diagnostics is not None else None,
                     error,
                     error,
                     job_id,
@@ -1165,9 +1178,7 @@ class Ledger:
             row = self.job(job_id)
             if row is None:
                 raise KeyError(job_id)
-            if action == "collect" and row["history"] and row["collection_state"] == "error":
-                self.db.execute("UPDATE jobs SET collection_state='pending' WHERE id=?", (job_id,))
-            elif action == "front" and row["state"] == "waiting":
+            if action == "front" and row["state"] == "waiting":
                 if self.edit_state():
                     raise Conflict("Queue order is locked while a batch is being edited")
                 minimum = self.db.execute("SELECT MIN(priority) FROM jobs").fetchone()[0]

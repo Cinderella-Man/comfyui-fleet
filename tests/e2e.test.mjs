@@ -62,6 +62,108 @@ async function setup(t, {nodeCount=2,toast="native"}={}) {
   return {page,post,state,fixture,submit,until};
 }
 
+test("result collection skips a missing cached preview and saves the final image without recovery", {timeout:30000}, async t=>{
+  const {page,post,submit,until}=await setup(t,{nodeCount:1});
+  const batch=await submit("Outpaint",2);
+  const first=(await until(s=>s.jobs.some(j=>j.acknowledged))).jobs.find(j=>j.occupied);
+  await post("/fixture",{worker:first.worker_id,complete:first.remote_id,
+    outputs:{"10":{images:[{filename:"cached-preview.png",type:"temp"}]},
+      "12":{images:[{filename:"outpaint.png",type:"output"}]}},
+    download_status:{"cached-preview.png":404}});
+  const settled=await until(s=>s.jobs.some(j=>j.id===first.id&&j.collection_state==="collected")&&
+    s.jobs.some(j=>j.id!==first.id&&j.acknowledged));
+  assert.equal(settled.suspensions.length,0);
+  assert.equal(settled.batch_counts[batch.batch_id].completed,1);
+  await page.evaluate(()=>window.comfyFleet.refresh());
+  assert.equal(await page.locator(`.fleet-job[data-job-id="${first.id}"]`).count(),0);
+  assert.equal(await page.getByRole("button",{name:"Retry saving results",exact:true}).count(),0);
+  const detail=await page.evaluate(async id=>{
+    const {api}=await import('/scripts/api.js');
+    return (await api.fetchApi(`/jobs/${id}`)).json();
+  },first.id);
+  assert.equal(detail.status,"completed");
+  assert.deepEqual(detail.outputs["10"].images,[]);
+  assert.equal(detail.outputs_count,1);
+  const ref=detail.outputs["12"].images[0];
+  assert.equal(ref.type,"output");
+  assert.match(ref.subfolder,/^fleet\//);
+  const url=new URL('/view',page.url());url.search=new URLSearchParams(ref).toString();
+  const image=await page.request.get(url.href);
+  assert.equal(image.status(),200);
+  assert.deepEqual([...((await image.body()).subarray(0,8))],[137,80,78,71,13,10,26,10]);
+  const attempts=await (await page.request.get(new URL('/fixture/requests',page.url()).href)).json();
+  assert.deepEqual(attempts[first.worker_id].downloads.map(ref=>[ref.filename,ref.status]),
+    [["cached-preview.png",404],["outpaint.png",200]]);
+  assert.equal(attempts[first.worker_id].submissions.filter(id=>id===first.remote_id).length,1);
+});
+
+for(const scenario of [
+  {name:"missing final image",http:404,type:"output",withFinal:true,collection:"partial",status:"completed"},
+  {name:"gone final image",http:410,type:"output",withFinal:true,collection:"partial",status:"completed"},
+  {name:"all final images missing",http:404,type:"output",withFinal:false,collection:"unavailable",status:"cancelled"},
+  {name:"only preview missing",http:404,type:"temp",withFinal:false,collection:"unavailable",status:"cancelled"},
+  {name:"download server error",http:500,type:"output",withFinal:false,collection:"error",status:"failed"},
+]) test(`result collection reports ${scenario.name} once, closes the job, and never retries`,{timeout:45000},async t=>{
+  const {page,post,state,submit,until}=await setup(t,{nodeCount:1});
+  await submit("Outpaint",2);
+  const first=(await until(s=>s.jobs.some(j=>j.acknowledged))).jobs.find(j=>j.occupied);
+  const outputs={"10":{images:[{filename:"unavailable.png",type:scenario.type}]}};
+  if(scenario.withFinal)outputs["12"]={images:[{filename:"saved.png",type:"output"}]};
+  await post("/fixture",{worker:first.worker_id,complete:first.remote_id,outputs,
+    download_status:{"unavailable.png":scenario.http}});
+  const settled=await until(s=>s.jobs.some(j=>j.id===first.id&&j.collection_state===scenario.collection)&&
+    s.jobs.some(j=>j.id!==first.id&&j.occupied&&j.acknowledged));
+  const next=settled.jobs.find(j=>j.id!==first.id&&j.occupied);
+  assert.equal(settled.suspensions.length,0,"A result error must not suspend the batch");
+  assert.equal(settled.jobs.find(j=>j.id===first.id).occupied,0);
+  await page.evaluate(()=>window.comfyFleet.refresh());
+  const notices=page.getByRole("region",{name:"Notifications",exact:true});
+  await notices.getByText(/The job is closed\./).waitFor();
+  const warnings=()=>page.evaluate(()=>window.nativeNotifications.filter(n=>n.severity==="warn"));
+  assert.equal((await warnings()).length,1);
+  assert.equal(await page.locator(`.fleet-job[data-job-id="${first.id}"]`).count(),0);
+  assert.equal(await page.getByRole("button",{name:"Retry saving results",exact:true}).count(),0);
+  assert.equal(await page.getByText("Results need attention",{exact:true}).count(),0);
+  const detail=await page.evaluate(async id=>{
+    const {api}=await import('/scripts/api.js');
+    return (await api.fetchApi(`/jobs/${id}`)).json();
+  },first.id);
+  assert.equal(detail.status,scenario.status);
+  assert.equal(detail.fleet.collection_state,scenario.collection);
+  assert.equal(detail.outputs_count,scenario.withFinal?1:0);
+  if(scenario.collection==="error")assert.match(detail.fleet.error,/HTTP 500.*unavailable\.png/);
+  else assert.equal(detail.fleet.diagnostics.missing_results[0].filename,"unavailable.png");
+  if(scenario.withFinal){
+    const url=new URL('/view',page.url());url.search=new URLSearchParams(detail.outputs["12"].images[0]).toString();
+    assert.equal((await page.request.get(url.href)).status(),200);
+  }
+  for(let i=0;i<3;i++)await page.evaluate(()=>window.comfyFleet.refresh());
+  assert.equal((await warnings()).length,1,"Polling must not repeat the error notification");
+  const requests=async()=>(await page.request.get(new URL('/fixture/requests',page.url()).href)).json();
+  const before=await requests();
+  assert.equal(before[first.worker_id].downloads.filter(r=>r.filename==="unavailable.png").length,1);
+  assert.deepEqual(before[first.worker_id].submissions,[first.remote_id,next.remote_id]);
+  const retry=await page.request.post(new URL(`/fleet/jobs/${first.id}/collect`,page.url()).href,{data:{}});
+  assert.equal(retry.status(),409,"Even a stale browser cannot restart result collection");
+  await post('/fixture',{restart:true});
+  await page.reload();
+  await page.getByRole("button",{name:"Manage nodes",exact:true}).waitFor();
+  await page.evaluate(()=>window.comfyFleet.refresh());
+  assert.equal((await state()).jobs.find(j=>j.id===next.id).occupied,1);
+  assert.deepEqual(await requests(),before,"Controller restart and browser reload must not repeat downloads or generation");
+  // Finish the following job and remove its node using the real UI. Closed errors
+  // must not retain a dependency on the node or require a recovery action.
+  await post('/fixture',{worker:next.worker_id,complete:next.remote_id});
+  await until(s=>s.jobs.some(j=>j.id===next.id&&j.collection_state==="collected"));
+  await page.getByRole("button",{name:"Manage nodes",exact:true}).click();
+  await page.getByRole("button",{name:"Remove Node 1",exact:true}).click();
+  await page.getByRole("dialog").getByRole("button",{name:"Remove node",exact:true}).click();
+  await page.getByRole("button",{name:"Done",exact:true}).click();
+  await until(s=>s.workers.length===0);
+  assert.equal(await page.getByRole("button",{name:"Retry saving results",exact:true}).count(),0);
+  assert.deepEqual(await requests(),before);
+});
+
 test("powering off all nodes drops only their interrupted jobs and automatically resumes queued work", {timeout:45000}, async t => {
   const {page,post,state,fixture,submit,until}=await setup(t,{nodeCount:3});
   const batch=await submit("Restart recovery",9);

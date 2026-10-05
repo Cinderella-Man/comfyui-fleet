@@ -32,6 +32,17 @@ The end-to-end fixture uses `.venv/bin/python`; set `FLEET_PYTHON` to override i
 All suites use temporary state and simulated ComfyUI workers. They do not
 connect to your configured workers or require GPUs.
 
+Result-collection coverage in `e2e.test.mjs` drives the real browser extension,
+Fleet HTTP routes, controller, SQLite ledger and file collection. Six cases cover
+a missing cached preview with an available final image, partially missing outputs
+(HTTP 404 and 410), all final images missing, a missing preview-only result and
+HTTP 500 during download. They verify accessible saved image bytes, finished
+history, queue continuation, a single warning for result failures, absent recovery
+controls, rejection of stale retry requests, no downloads or generation repeated
+after a controller restart/browser reload, and successful node removal.
+ComfyUI's host UI and worker endpoints are fixtures; these cases do not execute
+models or validate the native ComfyUI history component itself.
+
 Before a release, smoke test with real ComfyUI workers: submit jobs, check
 collected results and workflow loading, reorder and cancel work, and restart
 the controller with jobs queued. For batch editing, also verify source restoration,

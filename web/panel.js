@@ -12,7 +12,9 @@ const pageSize = 10;
 export function jobStatus(job) {
   if (!terminal.has(job.state) && job.cancel_requested) return "Cancelling";
   if (job.state === "unknown") return job.occupied ? "Checking job" : "Cancelled";
-  if (job.collection_state === "error") return "Results need attention";
+  if (job.collection_state === "error") return "Results not saved";
+  if (job.collection_state === "partial") return "Completed with missing results";
+  if (job.collection_state === "unavailable") return "Results unavailable";
   if (terminal.has(job.state) && job.collection_state === "pending") return "Saving results";
   return { waiting: "Queued", preparing: "Preparing", outstanding: "In progress",
     succeeded: "Completed", failed: "Failed", cancelled: "Cancelled" }[job.state] ?? "Needs review";
@@ -20,7 +22,7 @@ export function jobStatus(job) {
 
 function needsAttention(job) {
   if (job.state === "unknown" && !job.occupied) return false;
-  return !terminal.has(job.state) || job.occupied || ["pending", "error"].includes(job.collection_state);
+  return !terminal.has(job.state) || job.occupied || job.collection_state === "pending";
 }
 
 function stepProgress(job, snapshot = {}) {
@@ -364,6 +366,7 @@ export class FleetPanel {
     this.actions = actions;
     this.queueRows = new Map();
     this.workerPages = new Map();
+    this.reportedCollectionErrors = new Set();
     this.cancellingQueue = false;
     this.cancellingBatches = new Set();
     this.cancellingActive = false;
@@ -1074,11 +1077,11 @@ export class FleetPanel {
     this.status.hidden = !text || Boolean(issue) || (this.editing && !error);
   }
 
-  notify(text) {
+  notify(text, severity = "success") {
     this.dismissNotification();
     // Older hosts can lack the optional toast interface. Keep their feedback
     // temporary too, separately from errors and in-progress action messages.
-    try { if (this.actions.notify?.(text)) return; } catch { /* Use the inline fallback. */ }
+    try { if (this.actions.notify?.(text, severity)) return; } catch { /* Use the inline fallback. */ }
     this.notificationText.textContent = text;
     this.notification.hidden = false;
     this.notificationTimer = setTimeout(() => this.dismissNotification(), 5000);
@@ -1211,10 +1214,6 @@ export class FleetPanel {
     if (job.error && job.state !== "unknown") recovery.append(element("p", job.error));
     if (job.state === "unknown" && job.occupied) {
       recovery.append(element("p", "Fleet is checking this job. If the node no longer has it, it will be dropped and queued work will continue."));
-    }
-    if (job.collection_state === "error") {
-      recovery.append(element("p", "Retry saving the results without executing the workflow again."),
-        this.button("Retry saving results", () => this.actions.jobAction(job.id, "collect")));
     }
     if (recovery.childElementCount) article.append(recovery);
     return article;
@@ -1574,5 +1573,17 @@ export class FleetPanel {
     if (this.editing) this.renderDraftHardware();
     this.renderQueue();
     this.renderWorkers();
+    const errors = state.jobs.filter(job => !job.hidden && terminal.has(job.state) &&
+      ["error", "partial", "unavailable"].includes(job.collection_state));
+    const fresh = errors.filter(job => !this.reportedCollectionErrors.has(job.id));
+    this.reportedCollectionErrors = new Set(errors.map(job => job.id));
+    if (fresh.length) {
+      const job = fresh[0];
+      const name = state.batch_names?.[job.batch_id] || "Workflow batch";
+      const detail = job.error || (job.collection_state === "partial" ?
+        "Some result files were unavailable; available results were saved." : "Result files were unavailable.");
+      this.notify(fresh.length === 1 ? `“${name}”: ${detail} The job is closed.` :
+        `${fresh.length} jobs had errors saving results and were closed. See history for details.`, "warn");
+    }
   }
 }
